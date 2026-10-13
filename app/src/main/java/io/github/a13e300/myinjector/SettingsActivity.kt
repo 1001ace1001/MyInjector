@@ -1445,7 +1445,6 @@ class SettingsActivity : androidx.activity.ComponentActivity() {
         private val clipboardIconCache = java.util.concurrent.ConcurrentHashMap<String, Drawable>()
         private val loadingClipboardIcons = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
-
     }
 }
 
