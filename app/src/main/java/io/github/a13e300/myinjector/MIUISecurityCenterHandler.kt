@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ContentResolver
 import android.content.ContentValues
+import android.content.Context
 import android.net.Uri
 import android.os.Bundle
 import android.os.SystemProperties
@@ -16,8 +17,10 @@ import android.widget.Toast
 import io.github.a13e300.myinjector.arch.IHook
 import io.github.a13e300.myinjector.arch.addModuleAssets
 import io.github.a13e300.myinjector.arch.call
+import io.github.a13e300.myinjector.arch.callS
 import io.github.a13e300.myinjector.arch.hookAfter
 import io.github.a13e300.myinjector.arch.hookAllAfter
+import io.github.a13e300.myinjector.arch.hookAllBefore
 import io.github.a13e300.myinjector.arch.hookBefore
 import io.github.a13e300.myinjector.arch.hookReplace
 import io.github.a13e300.myinjector.arch.newInst
@@ -128,8 +131,50 @@ class MIUISecurityCenterHandler : IHook() {
         if (loadPackageParam.packageName == "com.miui.securitycenter") {
             hookSkipWarning()
             hookAddKeepAutoStart()
+            hookVetoDirectAutoStartDeny()
         }
     }
+
+    // Android 17 (security center 13.5.8): toggles may call the framework
+    // com.miui.permission.PermissionManager directly from this process (the osbot
+    // AI-assistant path does), bypassing the permmgr provider that LbeHandler guards
+    // inside the permission service. Veto deny sets for keep-listed packages here as
+    // well. HyperOS 3 keeps its proven behaviour: this veto is installed only when the
+    // permission manager service itself is the new 4.x generation.
+    private fun hookVetoDirectAutoStartDeny() = runCatching {
+        val ctx = findClassOrNull("android.app.ActivityThread")
+            ?.callS("currentApplication") as? Context ?: return@runCatching
+        val major = runCatching {
+            ctx.packageManager.getPackageInfo("com.lbe.security.miui", 0).versionName
+        }.getOrNull()?.substringBefore('.')?.toIntOrNull() ?: return@runCatching
+        if (major < 4) {
+            logI("keep-autostart: perm service is $major.x generation, direct-call veto not installed")
+            return@runCatching
+        }
+        val permManager = findClassOrNull("com.miui.permission.PermissionManager")
+            ?: return@runCatching
+        val permIdAutoStart = runCatching {
+            permManager.getDeclaredField("PERM_ID_AUTOSTART").apply { isAccessible = true }
+                .get(null) as? Long
+        }.getOrNull() ?: return@runCatching
+        permManager.hookAllBefore("setApplicationPermission") { param ->
+            val permId = (param.args.getOrNull(0) as? Long) ?: return@hookAllBefore
+            if (permId != permIdAutoStart) return@hookAllBefore
+            val action = (param.args.getOrNull(1) as? Int) ?: return@hookAllBefore
+            if (action == 3) return@hookAllBefore
+            val targets = param.args.drop(2).flatMap { arg ->
+                when (arg) {
+                    is String -> if (arg.isNotBlank()) listOf(arg) else emptyList()
+                    is Array<*> -> arg.filterIsInstance<String>().filter { it.isNotBlank() }
+                    else -> emptyList()
+                }
+            }.filter { queryKeepAutostart(ctx.contentResolver, it) == true }
+            if (targets.isEmpty()) return@hookAllBefore
+            logI("keep-autostart: veto direct PERM_ID_AUTOSTART deny (action=$action) for ${targets.joinToString()}")
+            param.result = null
+        }
+        logI("keep-autostart: direct-call deny veto installed for security center process")
+    }.onFailure { logE("hookVetoDirectAutoStartDeny: ", it) }
 
     private fun hookSkipWarning() = runCatching {
         val activityClass = findClass(

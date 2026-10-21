@@ -1,4 +1,4 @@
-# 权限管理服务「保持自启动」开关（HyperOS 3 修复）
+# 权限管理服务「保持自启动」开关（HyperOS 3 修复 + Android 17 适配）
 
 ## 问题现象
 
@@ -35,3 +35,37 @@ flag 语义与官方 OTA 迁移一致：迁移代码就是"旧 suggestAccept 位
 
 - 证据来源：`权限管理服务_1.9.2.apk` 与 `安全服务_12.8.1-260816.0.1.apk`（jadx 反编译，分别 4/65 个错误，相关类完整可读）。
 - 无已连接设备，CI 编译通过不代表真机验证。需验证：开关状态回显与切换、写入后 `permission_config_sharePref` 中出现对应包名、模块关闭后自启动在 30 天未使用场景下仍保持、云端 `AutoStartRevokeWhiteList` 推送是否影响该条目（`CloudUpdater` 存在移除逻辑）、旧版本设备上回退路径无回归。
+
+---
+
+# Android 17 适配（lbe-17 分支）
+
+## 新系统证据（权限管理服务 4.0.0 / 安全服务 13.5.8 反编译结论）
+
+Android 17（安全服务 13.5.8，权限管理服务 4.0.0）对该链路做了整体重构：
+
+- 权限管理服务的包名空间从 `com.lbe.security.*` 迁移到 `com.hyperos.security.*`，但**应用包名仍是 `com.lbe.security.miui`**，provider authority 仍是 `com.lbe.security.miui.permmgr`（`PermissionManagerProvider`，exported，要求 `miui.permission.READ_AND_WIRTE_PERMISSION_MANAGER`），`call(String, String, Bundle)` 三参签名与 `Integer.parseInt` 方法名解析不变——模块专用字符串方法名依旧不会与原生方法冲突。
+- 自启动状态从"私有 SP 白名单"变成**框架权限 `PERM_ID_AUTOSTART`**（`com.miui.permission.PermissionManager.setApplicationPermission`，action 3=允许 / 1=拒绝，底层 AppOps）。UI 开关（provider case 6）、云端 one-push 回收（`dealOnePush`）、第三方 SDK（`AutoStartManagerProvider`）、安全中心 osbot 全部汇入该框架调用。
+- `PermissionConfigSharePref` 里旧的白名单方法（`isAutoStartWhiteList` 等）**全部消失**，只剩云同步/one-push 记账；1.9.2 的 30 天调度器 `AutoRevokePermissionManager` 从该服务中**整体移除**，剩下的 JobService 只有云同步（205）、one-push（207）、数据上报（206）。`OnePushJobService` 的 AppOps `setMode` 调用全部传 mode 0（恢复自启动），不是回收路径。
+- 安全服务 13.5.8 的应用详情页结构**完全不变**：`com.miui.appmanager.fragment.ApplicationsDetailsFragment`、`R.xml.am_applications_detils_settings`、`app_detail_perm_category` 均在原位，UI 注入无需改动。
+
+## Android 17 上的实现（lbe-17）
+
+存储保持不变：`permission_config_sharePref` SP 的 `AUTO_START_WHITE_LIST` StringSet（与 1.9.x 官方格式一致，双版本共用），读写经由 `PermissionConfigSharePref.mSp` 静态字段（两个版本同名同型）；1.9.x 上仍优先转调原生白名单方法。
+
+执行层按版本自动选择：
+
+- **HyperOS 3（legacy helpers 存在）**：与原 lbe 分支完全一致（调度器 skip + nop 兜底），不新增任何 hook，零回归风险。
+- **Android 17（legacy helpers 缺失）**：
+  1. **deny 拦截**：hook 进程内框架 `com.miui.permission.PermissionManager.setApplicationPermission`（`PERM_ID_AUTOSTART` 运行时反射读取，失败回退 16384L），对 keep 列表内包名的非 action-3 调用一律置空 veto——覆盖云端 one-push 回收、provider case 6（UI）与一切进程内 deny。
+  2. **自愈看门狗**：`OnePushJobService.onStartJob` 后置 hook，对 keep 列表内包名重新授 action 3——兜住绕过权限管理服务进程的直接框架调用（如安全中心 osbot）造成的回收。
+  3. **安全中心进程内 veto**（`MIUISecurityCenterHandler`）：13.5.8 的部分路径（osbot/AI 助手）从安全中心进程直调框架 `PermissionManager`，在该进程同样 hook veto；以权限管理服务版本号 ≥ 4 为开关，HyperOS 3 不安装。
+
+语义统一为：**keep 开启 = 自启动锁定为开**；要先关自启动，先关「保持自启动」。
+
+## Android 17 验证限制
+
+- 证据来源：`权限管理服务_4.0.0.apk`、`安全服务_13.5.8-260908.0.1.apk`（jadx 反编译）。
+- 框架 `com.miui.permission.PermissionManager` 的方法重载以 4.0.0 进程内调用点归纳（`(JII String)`、`(JIII Bundle String)`、`(JII String[])`），veto 用通用扫描（args 中 String / String[]），不依赖具体重载。
+- `PERM_ID_AUTOSTART` 数值在框架内，运行时反射读取；不可读时回退 16384L 并记录日志。
+- 需真机验证：开关回显与切换、keep 后云端推送/重启/30 天场景自启动不再被回收、HyperOS 3 设备上行为与 lbe 分支完全一致、`adb logcat -s MyInjector` 观察 veto/看门狗日志。
