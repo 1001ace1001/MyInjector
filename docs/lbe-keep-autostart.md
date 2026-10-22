@@ -44,14 +44,16 @@ flag 语义与官方 OTA 迁移一致：迁移代码就是"旧 suggestAccept 位
 
 Android 17（安全服务 13.5.8，权限管理服务 4.0.0）对该链路做了整体重构：
 
-- 权限管理服务的包名空间从 `com.lbe.security.*` 迁移到 `com.hyperos.security.*`，但**应用包名仍是 `com.lbe.security.miui`**，provider authority 仍是 `com.lbe.security.miui.permmgr`（`PermissionManagerProvider`，exported，要求 `miui.permission.READ_AND_WIRTE_PERMISSION_MANAGER`），`call(String, String, Bundle)` 三参签名与 `Integer.parseInt` 方法名解析不变——模块专用字符串方法名依旧不会与原生方法冲突。
-- 自启动状态从"私有 SP 白名单"变成**框架权限 `PERM_ID_AUTOSTART`**（`com.miui.permission.PermissionManager.setApplicationPermission`，action 3=允许 / 1=拒绝，底层 AppOps）。UI 开关（provider case 6）、云端 one-push 回收（`dealOnePush`）、第三方 SDK（`AutoStartManagerProvider`）、安全中心 osbot 全部汇入该框架调用。
+- 权限管理服务的包名空间从 `com.lbe.security.*` 迁移到 `com.hyperos.security.*`，但**应用包名仍是 `com.lbe.security.miui`**，我手上这份 4.0.0 APK 的 provider authority 仍是 `com.lbe.security.miui.permmgr`（`PermissionManagerProvider`，exported，要求 `miui.permission.READ_AND_WIRTE_PERMISSION_MANAGER`），`call(String, String, Bundle)` 三参签名与 `Integer.parseInt` 方法名解析不变——模块专用字符串方法名依旧不会与原生方法冲突。**但真机日志显示设备上更新的构建已把 authority 改名**（对旧 authority 报 `Unknown authority`），因此安全中心侧改为运行时从 provider 列表动态解析（见下）。
+- 自启动状态从"私有 SP 白名单"变成**框架权限 `PERM_ID_AUTOSTART`**（`com.miui.permission.PermissionManager.setApplicationPermission`，action 3=允许 / 1=拒绝，底层 AppOps）。UI 开关（provider case 6）、云端 one-push 回收（`dealOnePush`）、第三方 SDK（`AutoStartManagerProvider`）、安全中心 osbot 全部汇入该框架调用。**真机日志确认 `PERM_ID_AUTOSTART == 16384`**（正是旧 `suggestAccept` 的自启动位）。
 - `PermissionConfigSharePref` 里旧的白名单方法（`isAutoStartWhiteList` 等）**全部消失**，只剩云同步/one-push 记账；1.9.2 的 30 天调度器 `AutoRevokePermissionManager` 从该服务中**整体移除**，剩下的 JobService 只有云同步（205）、one-push（207）、数据上报（206）。`OnePushJobService` 的 AppOps `setMode` 调用全部传 mode 0（恢复自启动），不是回收路径。
 - 安全服务 13.5.8 的应用详情页结构**完全不变**：`com.miui.appmanager.fragment.ApplicationsDetailsFragment`、`R.xml.am_applications_detils_settings`、`app_detail_perm_category` 均在原位，UI 注入无需改动。
 
 ## Android 17 上的实现（lbe-17）
 
-存储保持不变：`permission_config_sharePref` SP 的 `AUTO_START_WHITE_LIST` StringSet（与 1.9.x 官方格式一致，双版本共用），读写经由 `PermissionConfigSharePref.mSp` 静态字段（两个版本同名同型）；1.9.x 上仍优先转调原生白名单方法。
+存储文件保持不变：`permission_config_sharePref` SP 的 `AUTO_START_WHITE_LIST` StringSet（与 1.9.x 官方格式一致，双版本共用）。但**4.x 上不再经 `PermissionConfigSharePref.mSp` 静态字段读写**（原因见事故复盘第三条），改为经进程 Application 上下文打开同一 SP 文件（进程内 `getSharedPreferences` 返回同一缓存实例，与服务自身 `mSp` 完全一致）；1.9.x 上仍优先转调原生白名单方法。
+
+安全中心侧不再硬编码 provider authority：运行时用 `GET_PROVIDERS` 从权限管理服务的 provider 列表中按类名 `PermissionManagerProvider` 解析真实 authority，解析不到再依次尝试已知候选（`com.lbe.security.miui.permmgr`、`com.hyperos.security.miui.permmgr`），`Unknown authority` 自动跳下一个。
 
 执行层按版本自动选择：
 
@@ -63,17 +65,19 @@ Android 17（安全服务 13.5.8，权限管理服务 4.0.0）对该链路做了
 
 语义统一为：**keep 开启 = 自启动锁定为开**；要先关自启动，先关「保持自启动」。
 
-## Android 17 首版事故复盘（v1 → v2）
+## Android 17 真机事故复盘（v1 → v2 → v3）
 
-第一版 lbe-17（4284a1b）在 Android 17 真机上导致权限管理异常，三个教训均已修复：
+v1（4284a1b）在 Android 17 真机上导致权限管理异常；v2（e5dad70）修了三个缺陷但**仍崩溃循环**；真机日志（`logcat -s MyInjector`）最终定位真因，v3 全部修复：
 
-- **`PERM_ID_AUTOSTART` 猜错了值**：v1 在反射失败时回退 16384L——那是旧 `suggestAccept` 表的位**值**（1<<14），而 1.9.2 OTA 迁移循环（`long j9 = i2; if (j9 == PERM_ID_AUTOSTART)`）证明框架常量是位**索引**（14 一类的小整数）。看门狗拿着 16384 每次云任务都给 keep 包写错误权限 ID，污染权限库。v2：按 `Number` 读取，读不到就不装执行层。
-- **全量 hook 按位置猜参数**：v1 对所有 `setApplicationPermission` 重载用 `args[0]/args[1]` 判断 permId/action，其他重载若参数布局不同就会误判误拦。v2：精确签名白名单 + action == 1。
-- **`param.result = null` 打在非 void 返回上**：原始类型返回值拆箱 null 会 NPE。v2：按返回类型给默认值；同时撤掉了安全中心进程内的直调 veto（它挂在 UI 每次权限切换的路径上，收益小风险大，由看门狗兜底即可）。
+- **v3 修复——`mSp` 反射毒化服务类（崩溃循环真因）**：v1/v2 都通过 `PermissionConfigSharePref.mSp` 静态字段读 keep 列表。`field.get(null)` 会强制类初始化，而该类静态块执行 `Application.getApplication().getSharedPreferences(...)`——当 hook 在 Application 就绪前（启动期的权限 deny binder 调用）触发它，静态块 NPE，类被**永久毒化**（后续 `NoClassDefFoundError`），服务原生代码一碰该类就崩 → 进程被拉起 → 启动期再触发 → 再崩，**每 ~10 秒一循环**（日志中 com.lbe.security.miui 进程 pid 持续翻新即此）。v2 的三处修复都没碰这个点，所以"还是炸了"。v3：彻底不再触碰该类，改经进程上下文开同一 SP 文件；Application 未就绪时保持惰性（返回空列表），任何路径都不再初始化服务类。
+- **v2 修复（真机日志证伪了 v2 的 permId 担忧）**：v1 曾在反射失败时回退 16384L。真机日志 `PERM_ID_AUTOSTART=16384` 证明常量真值就是 16384（旧 suggestAccept 位值），此前"位索引 14"的推断是 jadx 反编译误导。v2 的 `Number` 语义读取 + 读不到不安装的防御保留（猜值风险确实存在，只是这次没踩中）。
+- **v2 修复——全量 hook 按位置猜参数**：v1 对所有 `setApplicationPermission` 重载用 `args[0]/args[1]` 判断 permId/action，其他重载若参数布局不同就会误判误拦。v2：精确签名白名单 + action == 1。
+- **v2 修复——`param.result = null` 打在非 void 返回上**：原始类型返回值拆箱 null 会 NPE。v2：按返回类型给默认值；同时撤掉了安全中心进程内的直调 veto（它挂在 UI 每次权限切换的路径上，收益小风险大，由看门狗兜底即可）。
+- **v3 修复——设备构建的 authority 已改名**：真机日志安全中心侧对 `com.lbe.security.miui.permmgr` 报 `Unknown authority`（手上的 4.0.0 APK 尚未改名，设备构建更新），因此 GET/SET 全部到不了服务。v3 动态解析真实 authority。
 
 ## Android 17 验证限制
 
-- 证据来源：`权限管理服务_4.0.0.apk`、`安全服务_13.5.8-260908.0.1.apk`（jadx 反编译）。
-- 框架 `com.miui.permission.PermissionManager` 的方法重载以 4.0.0 进程内调用点归纳（`(JII String)`、`(JIII Bundle String)`、`(JII String[])`），veto 仅对这三种签名生效，其余一律放行。
-- `PERM_ID_AUTOSTART` 数值在框架内，运行时按 `Number` 反射读取（1.9.2 迁移代码证明它是位索引而非位值）；不可读时整套执行层不安装并记录日志。
-- 需真机验证：开关回显与切换、keep 后云端推送/重启/30 天场景自启动不再被回收、HyperOS 3 设备上行为与 lbe 分支完全一致、`adb logcat -s MyInjector` 观察 veto/看门狗日志。
+- 证据来源：`权限管理服务_4.0.0.apk`、`安全服务_13.5.8-260908.0.1.apk`（jadx 反编译）+ 真机 `logcat -s MyInjector` 日志（崩溃循环、PERM_ID_AUTOSTART=16384、Unknown authority 三项事实均来自真机）。
+- 框架 `com.miui.permission.PermissionManager` 的方法重载以 4.0.0 进程内调用点归纳（`(JII String)`、`(JIII Bundle String)`、`(JII String[])`），veto 仅对这三种签名生效，其余一律放行；设备构建若签名有出入则对应路径不生效（安全但需日志确认）。
+- `PERM_ID_AUTOSTART` 运行时按 `Number` 反射读取；不可读时整套执行层不安装并记录日志。
+- 需真机复验（v3）：权限服务进程不再 ~10 秒重启（`adb shell ps -A | grep lbe` 观察或看 `logcat -b crash` 是否还有 FATAL）、开关回显与切换恢复、`logcat -s MyInjector` 应出现 `permmgr uris =` 与 GET/SET/veto/看门狗日志；若权限服务仍崩溃，请抓 `adb logcat -b crash -d`（MyInjector 标签过滤不到原生崩溃栈）。

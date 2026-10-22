@@ -1,7 +1,6 @@
 package io.github.a13e300.myinjector
 
 import android.content.Context
-import android.content.SharedPreferences
 import android.os.Bundle
 import io.github.a13e300.myinjector.arch.IHook
 import io.github.a13e300.myinjector.arch.call
@@ -32,14 +31,20 @@ import kotlin.concurrent.thread
  * same storage and is enforced here. Semantics: while keep is ON the autostart
  * permission is locked ON; turn keep OFF first to disable autostart for that package.
  *
- * Enforcement is deliberately surgical (hardened after the first Android 17 build
- * broke the permission manager):
- * - PERM_ID_AUTOSTART is a small INDEX constant, not the legacy 1<<14 flag value:
- *   the 1.9.2 OTA migration loop compares it against the bit index of that flag
- *   (long j9 = i2; if (j9 == PERM_ID_AUTOSTART) ...). It is read as a Number at
- *   runtime and enforcement is installed only when the read succeeds — a wrong id
- *   (the removed 16384L guess) would have the watchdog write foreign permission ids
- *   into the store.
+ * Enforcement is deliberately surgical (hardened twice after real-device feedback):
+ * - Storage must never force PermissionConfigSharePref class initialization: its
+ *   static block runs Application.getApplication().getSharedPreferences(...), and
+ *   triggering it from an early binder thread (before the Application is up) NPEs
+ *   the static initializer and permanently poisons the class - the stock service
+ *   then dies with NoClassDefFoundError on every restart: a ~10s crash loop that
+ *   took down the whole permission manager. The SharedPreferences file is
+ *   process-global, so on 4.x the keep list is opened through the process
+ *   application context, which yields the exact same cached instance without
+ *   loading any service class. The mSp static-field reflection is gone.
+ * - PERM_ID_AUTOSTART is read at runtime as a Number and enforcement is installed
+ *   only when the read succeeds (the device log confirmed the value 16384, the old
+ *   suggestAccept bit); a wrong guessed id would have the watchdog write foreign
+ *   permission ids into the store.
  * - Only the exact setApplicationPermission overloads the service's own autostart
  *   paths use are inspected (dealOnePush: (long,int,int,String) deny;
  *   AutoStartManagerProvider.switchAutoStart: (long,int,int,int,Bundle,String);
@@ -79,16 +84,27 @@ class LbeHandler : IHook() {
         val legacyHelpers = flagManager.declaredMethods.any { it.name == LEGACY_METHOD_IS_KEEP }
         logI("keep-autostart: flagManager=${flagManager.name} legacyHelpers=$legacyHelpers")
 
-        // The keep list always lives in the service-private SharedPreferences behind
-        // PermissionConfigSharePref.mSp; both generations expose the same static field.
-        val spField = runCatching {
-            flagManager.getDeclaredField("mSp").apply { isAccessible = true }
-        }.onFailure {
-            logE("keep-autostart: failed to resolve PermissionConfigSharePref.mSp", it)
-        }.getOrNull()
+        // The keep list always lives in the service-private SharedPreferences
+        // "permission_config_sharePref" (key AUTO_START_WHITE_LIST). On 4.x the file
+        // is opened through the process application context: the exact same cached
+        // SharedPreferences instance the service uses, but WITHOUT ever loading
+        // PermissionConfigSharePref - its static block runs Application.getApplication()
+        // and crashes (permanently poisoning the class) when triggered before the
+        // Application is ready, which is what crash-looped the service. HyperOS 3
+        // keeps using the stock helper methods.
+        val activityThread = findClassOrNull("android.app.ActivityThread")
+        var appCtx: Context? = null
+        fun appContext(): Context? {
+            appCtx?.let { return it }
+            val ctx = runCatching {
+                activityThread?.callS("currentApplication") as? Context
+            }.getOrNull() ?: return null
+            appCtx = ctx
+            return ctx
+        }
 
         fun keepSet(): Set<String> = runCatching {
-            (spField?.get(null) as? SharedPreferences)
+            appContext()?.getSharedPreferences(SP_NAME, Context.MODE_PRIVATE)
                 ?.getStringSet(KEY_KEEP_AUTO_START, emptySet()).orEmpty()
         }.getOrDefault(emptySet())
 
@@ -109,7 +125,7 @@ class LbeHandler : IHook() {
                 )
                 return true
             }
-            val prefs = runCatching { spField?.get(null) as? SharedPreferences }.getOrNull() ?: return false
+            val prefs = appContext()?.getSharedPreferences(SP_NAME, Context.MODE_PRIVATE) ?: return false
             val set = (prefs.getStringSet(KEY_KEEP_AUTO_START, emptySet()) ?: emptySet()).toMutableSet()
             if (enable) set.add(pkg) else set.remove(pkg)
             prefs.edit().putStringSet(KEY_KEEP_AUTO_START, set).apply()
@@ -164,9 +180,9 @@ class LbeHandler : IHook() {
             return
         }
 
-        // PERM_ID_AUTOSTART is an index-style constant (14-shaped, NOT the legacy
-        // 1<<14 flag value). Read it as a Number; if that fails, install nothing —
-        // guessing would poison the permission store through the watchdog.
+        // Read the framework constant as a Number; if that fails, install nothing —
+        // a wrong guessed id would poison the permission store through the watchdog.
+        // (Confirmed 16384 = the old suggestAccept autostart bit on the device.)
         val permIdAutoStart = runCatching {
             permManager.getDeclaredField("PERM_ID_AUTOSTART").apply { isAccessible = true }
                 .get(null) as? Number
@@ -263,8 +279,11 @@ class LbeHandler : IHook() {
         const val METHOD_GET_KEEP_AUTOSTART = "myinjector_get_keep_autostart"
         const val METHOD_SET_KEEP_AUTOSTART = "myinjector_set_keep_autostart"
 
-        /** Same storage as the official 1.9.x whitelist: SharedPreferences
-         *  "permission_config_sharePref" (PermissionConfigSharePref.mSp), StringSet key. */
+        /** Same storage as the official 1.9.x whitelist: the service-private
+         *  SharedPreferences "permission_config_sharePref" (StringSet key
+         *  AUTO_START_WHITE_LIST), opened via the process app context on 4.x. */
+        private const val SP_NAME = "permission_config_sharePref"
+
         private const val KEY_KEEP_AUTO_START = "AUTO_START_WHITE_LIST"
 
         private const val LEGACY_METHOD_IS_KEEP = "isAutoStartWhiteList"
