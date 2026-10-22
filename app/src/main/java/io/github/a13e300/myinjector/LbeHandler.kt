@@ -1,6 +1,11 @@
 package io.github.a13e300.myinjector
 
+import android.content.ContentProvider
+import android.content.Context
+import android.content.pm.PackageInfo
+import android.os.Binder
 import android.os.Bundle
+import android.os.Process
 import io.github.a13e300.myinjector.arch.IHook
 import io.github.a13e300.myinjector.arch.callS
 import io.github.a13e300.myinjector.arch.hookAllNop
@@ -22,8 +27,12 @@ import io.github.a13e300.myinjector.arch.hookBefore
 class LbeHandler : IHook() {
     override fun onHook() {
         if (loadPackageParam.packageName != "com.lbe.security.miui") return
-        findClass("com.miui.privacy.autostart.AutoRevokePermissionManager")
-            .hookAllNop("lambda\$startScheduleASCheck\$1")
+        if (findClassOrNull("com.hyperos.security.service.provider.PermissionManagerProvider") != null) {
+            hookAndroid17OnePush()
+            return
+        }
+        findClassOrNull("com.miui.privacy.autostart.AutoRevokePermissionManager")
+            ?.hookAllNop("lambda\$startScheduleASCheck\$1")
         // HyperOS 3+ flag storage; older versions keep using the legacy table and the
         // switch falls back automatically when these methods answer nothing.
         val flagManager = findClassOrNull("com.lbe.security.utility.PermissionConfigSharePref")
@@ -76,6 +85,83 @@ class LbeHandler : IHook() {
             }
         }
         logI("keep-autostart provider extension installed")
+    }
+
+    /** 4.0.0: the preference persists; enforcement still requires this module. */
+    private fun hookAndroid17OnePush() {
+        val provider = findClass("com.hyperos.security.service.provider.PermissionManagerProvider")
+        fun prefs(context: Context) = context.getSharedPreferences("myinjector_onepush_keep_v1", Context.MODE_PRIVATE)
+        fun protected(context: Context, pkg: String, userId: Int): Boolean = runCatching {
+            prefs(context).getBoolean("$userId@$pkg", false)
+        }.onFailure { logE("OnePush protection: read failed", it) }.getOrDefault(false)
+
+        val scheduledInstalled = runCatching {
+            val task = findClass("com.hyperos.security.service.OnePushJobService\$GetCloudDataTask")
+            task.hookBefore(
+                "revokeAutoStart", Context::class.java, PackageInfo::class.java, List::class.java
+            ) { param ->
+                val context = param.args[0] as? Context ?: return@hookBefore
+                val info = param.args[1] as? PackageInfo ?: return@hookBefore
+                val uid = info.applicationInfo?.uid ?: return@hookBefore
+                if (!protected(context, info.packageName, uid / 100000)) return@hookBefore
+                logI("OnePush protection: skipped scheduled revoke for ${info.packageName}")
+                param.result = null
+            }
+            logI("OnePush protection: scheduled revoke hook installed")
+        }.onFailure { logE("OnePush protection: scheduled revoke hook unavailable", it) }.isSuccess
+
+        val registrationInstalled = runCatching {
+            provider.hookBefore("dealOnePush", Bundle::class.java) { param ->
+                val request = param.args[0] as? Bundle ?: return@hookBefore
+                if (request.getString("call_pkg") != "com.xiaomi.xmsf" ||
+                    !request.getBoolean("regist_deregist", false)
+                ) return@hookBefore
+                val pkg = request.getString("regist_deregist_pkg")?.takeIf { it.isNotBlank() }
+                    ?: return@hookBefore
+                val context = (param.thisObject as? ContentProvider)?.context ?: return@hookBefore
+                val userId = request.getInt("regist_deregist_pkg_userid", Process.myUid() / 100000)
+                if (!protected(context, pkg, userId)) return@hookBefore
+                logI("OnePush protection: skipped registration revoke for $pkg user=$userId")
+                // Deregistration and historical recovery continue through stock code.
+                param.result = Bundle().apply { putBoolean("auto_start_set_status", false) }
+            }
+            logI("OnePush protection: registration revoke hook installed")
+        }.onFailure { logE("OnePush protection: registration revoke hook unavailable", it) }.isSuccess
+
+        provider.hookBefore("call", String::class.java, String::class.java, Bundle::class.java) { param ->
+            val method = param.args[0] as? String
+            if (method != METHOD_GET_KEEP_AUTOSTART && method != METHOD_SET_KEEP_AUTOSTART) return@hookBefore
+            // Handle only our extension strings; never change numeric stock methods.
+            val result = Bundle()
+            param.result = result
+            runCatching {
+                check(scheduledInstalled && registrationInstalled) { "OnePush hooks incomplete" }
+                val context = (param.thisObject as ContentProvider).context ?: error("Provider not attached")
+                val caller = Binder.getCallingUid()
+                check(caller == Process.myUid() || caller % 100000 == 1000) { "Caller not allowed" }
+                val extras = param.args[2] as? Bundle
+                val userId = extras?.getInt("userId", caller / 100000) ?: (caller / 100000)
+                require(userId >= 0 && (userId == caller / 100000 || caller % 100000 == 1000))
+                val pkg = (if (method == METHOD_GET_KEEP_AUTOSTART) param.args[1] as? String
+                    else extras?.getString("pkg")) ?: error("Missing package")
+                require(pkg.isNotBlank() && pkg.length <= 255 && !pkg.contains('@'))
+                val storage = prefs(context)
+                val key = "$userId@$pkg"
+                if (method == METHOD_SET_KEEP_AUTOSTART) {
+                    val values = requireNotNull(extras)
+                    require(values.containsKey("enable"))
+                    check(storage.edit().putBoolean(key, values.getBoolean("enable")).commit()) { "Preference write failed" }
+                }
+                val keep = storage.getBoolean(key, false)
+                result.putBoolean("keep", keep)
+                result.putBoolean("ok", true)
+                logI("OnePush keep $method user=$userId pkg=$pkg keep=$keep")
+            }.onFailure {
+                result.putBoolean("ok", false)
+                logE("OnePush keep extension failed", it)
+            }
+        }
+        logI("OnePush protection: per-app provider extension installed; default off, no permanent native flag")
     }
 
     companion object {

@@ -198,6 +198,96 @@ class MIUISecurityCenterHandler : IHook() {
                     ?: return@hookAllAfter
                 val pref = miuixCheckBoxPref.newInst(ctx)
                 pref.call("setKey", "keep_autostart")
+                val modernPermissionService = runCatching {
+                    ctx.packageManager.getPackageInfo("com.lbe.security.miui", 0).longVersionCode >= 400L
+                }.getOrNull()
+                if (modernPermissionService != false) {
+                    pref.call("setTitle", "保持自启动")
+                    pref.call("setEnabled", false)
+                    pref.call("setChecked", false)
+                    cat.call("addPreference", pref)
+                    if (modernPermissionService == null) {
+                        logW("keep-autostart: permission service version unknown; no legacy fallback")
+                        Toast.makeText(ctx, "无法确认权限服务版本，保持自启动暂不可用", Toast.LENGTH_SHORT).show()
+                        return@hookAllAfter
+                    }
+                    val userId = ctx.intent.getIntExtra(
+                        "miui.intent.extra.USER_ID", ctx.applicationInfo.uid / 100000
+                    )
+                    fun readModernKeep(): Boolean {
+                        val result = ctx.contentResolver.call(
+                            PERM_MGR_URI, LbeHandler.METHOD_GET_KEEP_AUTOSTART, currentPkgName,
+                            Bundle().apply { putInt("userId", userId) }
+                        ) ?: error("keep-autostart GET returned no result")
+                        check(result.getBoolean("ok") && result.containsKey("keep")) {
+                            "keep-autostart GET rejected or missing state"
+                        }
+                        return result.getBoolean("keep")
+                    }
+                    var busy = true // Accessed only on the UI thread.
+                    fun finishRead(checked: Boolean?) {
+                        ctx.runOnUiThread {
+                            if (checked != null) pref.call("setChecked", checked)
+                            pref.call("setEnabled", checked != null)
+                            busy = false
+                        }
+                    }
+                    fun modifyModernKeep(enabled: Boolean) {
+                        var confirmed: Boolean? = null
+                        runCatching {
+                            val result = ctx.contentResolver.call(
+                                PERM_MGR_URI, LbeHandler.METHOD_SET_KEEP_AUTOSTART, null,
+                                Bundle().apply {
+                                    putString("pkg", currentPkgName)
+                                    putBoolean("enable", enabled)
+                                    putInt("userId", userId)
+                                }
+                            ) ?: error("keep-autostart SET returned no result")
+                            check(result.getBoolean("ok") && result.containsKey("keep") &&
+                                result.getBoolean("keep") == enabled) {
+                                "keep-autostart SET rejected or returned unexpected state"
+                            }
+                            confirmed = readModernKeep()
+                            check(confirmed == enabled) { "keep-autostart readback mismatch" }
+                        }.onFailure {
+                            logE("keep-autostart SET/readback failed for $currentPkgName user $userId", it)
+                            // A failed SET may still have reached the provider. Restore only
+                            // a fresh backend state, never blindly invert the checkbox.
+                            confirmed = runCatching { readModernKeep() }.onFailure { failure ->
+                                logE("keep-autostart recovery GET failed", failure)
+                            }.getOrNull()
+                            ctx.runOnUiThread {
+                                Toast.makeText(ctx, "修改保持自启动失败", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                        finishRead(confirmed)
+                    }
+                    val listener = Proxy.newProxyInstance(
+                        prefChangeListenerClass.classLoader, arrayOf(prefChangeListenerClass)
+                    ) { _, method, args ->
+                        if (method.name == "onPreferenceChange") {
+                            if (!busy) {
+                                busy = true
+                                pref.call("setEnabled", false)
+                                val enabled = args[1] as Boolean
+                                thread { modifyModernKeep(enabled) }
+                            }
+                            return@newProxyInstance false
+                        }
+                        return@newProxyInstance null
+                    }
+                    pref.call("setOnPreferenceChangeListener", listener)
+                    thread {
+                        val checked = runCatching { readModernKeep() }.onFailure {
+                            logE("keep-autostart initial GET failed for $currentPkgName user $userId", it)
+                            ctx.runOnUiThread {
+                                Toast.makeText(ctx, "获取保持自启动失败", Toast.LENGTH_SHORT).show()
+                            }
+                        }.getOrNull()
+                        finishRead(checked)
+                    }
+                    return@hookAllAfter
+                }
                 pref.call("setTitle", "保持自启动")
                 cat.call("addPreference", pref)
                 logI("keep-autostart switch injected for $currentPkgName")
