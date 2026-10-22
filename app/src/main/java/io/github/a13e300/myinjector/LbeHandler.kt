@@ -10,6 +10,7 @@ import io.github.a13e300.myinjector.arch.hookAfter
 import io.github.a13e300.myinjector.arch.hookAllBefore
 import io.github.a13e300.myinjector.arch.hookAllNop
 import io.github.a13e300.myinjector.arch.hookBefore
+import java.lang.reflect.Method
 import kotlin.concurrent.thread
 
 /**
@@ -26,15 +27,28 @@ import kotlin.concurrent.thread
  * Android 17 / HyperOS next (permission manager 4.0.0, security center 13.5.8) moved
  * the whole namespace to com.hyperos.security.* and turned autostart into the plain
  * framework permission PERM_ID_AUTOSTART (com.miui.permission.PermissionManager.
- * setApplicationPermission, action 3 = allow / 1 = deny; backed by AppOps). The
- * AUTO_START_WHITE_LIST helpers and the 30-day scheduler are gone from the service;
- * the only deny funnel inside this process is the framework PermissionManager. The
- * keep flag therefore keeps the same storage (the service-private SharedPreferences
- * "permission_config_sharePref", key AUTO_START_WHITE_LIST, StringSet — identical to
- * the 1.9.x format) and is now enforced here: deny sets for keep-listed packages are
- * vetoed at the funnel, and every OnePushJobService run re-grants action 3. Semantics:
- * while keep is ON the autostart permission is locked ON; turn keep OFF first to
- * disable autostart for that package.
+ * setApplicationPermission, action 3 = allow / 1 = deny). The AUTO_START_WHITE_LIST
+ * helpers and the 30-day scheduler are gone from the service; the keep flag keeps the
+ * same storage and is enforced here. Semantics: while keep is ON the autostart
+ * permission is locked ON; turn keep OFF first to disable autostart for that package.
+ *
+ * Enforcement is deliberately surgical (hardened after the first Android 17 build
+ * broke the permission manager):
+ * - PERM_ID_AUTOSTART is a small INDEX constant, not the legacy 1<<14 flag value:
+ *   the 1.9.2 OTA migration loop compares it against the bit index of that flag
+ *   (long j9 = i2; if (j9 == PERM_ID_AUTOSTART) ...). It is read as a Number at
+ *   runtime and enforcement is installed only when the read succeeds — a wrong id
+ *   (the removed 16384L guess) would have the watchdog write foreign permission ids
+ *   into the store.
+ * - Only the exact setApplicationPermission overloads the service's own autostart
+ *   paths use are inspected (dealOnePush: (long,int,int,String) deny;
+ *   AutoStartManagerProvider.switchAutoStart: (long,int,int,int,Bundle,String);
+ *   provider case 6 / security center: (long,int,int,String[])). Positional arg
+ *   guessing across every overload could veto unrelated permission changes.
+ * - The veto returns a return-type-safe default instead of raw null, so primitive-
+ *   returning overloads cannot crash the caller on unboxing.
+ * - The watchdog re-grants only after querying the current action through the
+ *   service's own PermissionUtil, so healthy entries are never re-written.
  */
 class LbeHandler : IHook() {
     override fun onHook() {
@@ -66,16 +80,17 @@ class LbeHandler : IHook() {
         logI("keep-autostart: flagManager=${flagManager.name} legacyHelpers=$legacyHelpers")
 
         // The keep list always lives in the service-private SharedPreferences behind
-        // PermissionConfigSharePref.mSp; both versions expose the same static field.
-        fun sp(): SharedPreferences? = runCatching {
-            val field = flagManager.getDeclaredField("mSp").apply { isAccessible = true }
-            field.get(null) as? SharedPreferences
+        // PermissionConfigSharePref.mSp; both generations expose the same static field.
+        val spField = runCatching {
+            flagManager.getDeclaredField("mSp").apply { isAccessible = true }
         }.onFailure {
-            logE("keep-autostart: failed to access PermissionConfigSharePref.mSp", it)
+            logE("keep-autostart: failed to resolve PermissionConfigSharePref.mSp", it)
         }.getOrNull()
 
-        fun keepSet(): Set<String> =
-            sp()?.getStringSet(KEY_KEEP_AUTO_START, emptySet()).orEmpty()
+        fun keepSet(): Set<String> = runCatching {
+            (spField?.get(null) as? SharedPreferences)
+                ?.getStringSet(KEY_KEEP_AUTO_START, emptySet()).orEmpty()
+        }.getOrDefault(emptySet())
 
         fun readKeep(pkg: String): Boolean {
             if (legacyHelpers) {
@@ -94,7 +109,7 @@ class LbeHandler : IHook() {
                 )
                 return true
             }
-            val prefs = sp() ?: return false
+            val prefs = runCatching { spField?.get(null) as? SharedPreferences }.getOrNull() ?: return false
             val set = (prefs.getStringSet(KEY_KEEP_AUTO_START, emptySet()) ?: emptySet()).toMutableSet()
             if (enable) set.add(pkg) else set.remove(pkg)
             prefs.edit().putStringSet(KEY_KEEP_AUTO_START, set).apply()
@@ -148,42 +163,68 @@ class LbeHandler : IHook() {
             logI("keep-autostart: framework PermissionManager missing, enforcement NOT installed")
             return
         }
+
+        // PERM_ID_AUTOSTART is an index-style constant (14-shaped, NOT the legacy
+        // 1<<14 flag value). Read it as a Number; if that fails, install nothing —
+        // guessing would poison the permission store through the watchdog.
         val permIdAutoStart = runCatching {
             permManager.getDeclaredField("PERM_ID_AUTOSTART").apply { isAccessible = true }
-                .get(null) as? Long
-        }.getOrNull() ?: FALLBACK_PERM_ID_AUTOSTART.also {
-            logW("keep-autostart: PERM_ID_AUTOSTART unreadable, falling back to $it")
+                .get(null) as? Number
+        }.getOrNull()?.toLong() ?: run {
+            logW("keep-autostart: PERM_ID_AUTOSTART unreadable, enforcement NOT installed")
+            return
+        }
+        logI("keep-autostart: PERM_ID_AUTOSTART=$permIdAutoStart")
+
+        // Only the overloads the service's own autostart paths use; every other
+        // signature (whatever else the framework may declare) is skipped untouched.
+        val knownSignatures = listOf(
+            arrayOf<Class<*>>(java.lang.Long.TYPE, Integer.TYPE, Integer.TYPE, String::class.java),
+            arrayOf<Class<*>>(java.lang.Long.TYPE, Integer.TYPE, Integer.TYPE, Array<String>::class.java),
+            arrayOf(
+                java.lang.Long.TYPE, Integer.TYPE, Integer.TYPE, Integer.TYPE,
+                Bundle::class.java, String::class.java
+            )
+        )
+        fun Method.isKnownSignature(): Boolean =
+            knownSignatures.any { it.contentEquals(parameterTypes) }
+
+        // A veto must not return null from a primitive-returning method (unboxing NPE).
+        fun Method.defaultResult(): Any? = when (returnType) {
+            java.lang.Boolean.TYPE -> false
+            Integer.TYPE -> 0
+            java.lang.Long.TYPE -> 0L
+            else -> null // void / reference types
         }
 
-        fun denyPackages(args: Array<Any?>): List<String> = args.drop(2).flatMap { arg ->
-            when (arg) {
-                is String -> if (arg.isNotBlank()) listOf(arg) else emptyList()
-                is Array<*> -> arg.filterIsInstance<String>().filter { it.isNotBlank() }
-                else -> emptyList()
-            }
-        }
-
-        // 4.0.0's own revocation paths (cloud one-push in PermissionManagerProvider.dealOnePush,
-        // the provider's generic set method) all funnel into the framework call below;
-        // a UI-driven deny arrives here too via the provider switch case 6.
         permManager.hookAllBefore("setApplicationPermission") { param ->
-            val permId = (param.args.getOrNull(0) as? Long) ?: return@hookAllBefore
-            if (permId != permIdAutoStart) return@hookAllBefore
-            val action = (param.args.getOrNull(1) as? Int) ?: return@hookAllBefore
-            if (action == ACTION_ALLOW) return@hookAllBefore
-            val targets = denyPackages(param.args).filter { it in keepSet() }
+            val method = param.method as? Method ?: return@hookAllBefore
+            if (!method.isKnownSignature()) return@hookAllBefore
+            if ((param.args.getOrNull(0) as? Number)?.toLong() != permIdAutoStart) return@hookAllBefore
+            // action 1 is the only revoke action the system's autostart paths use
+            if ((param.args.getOrNull(1) as? Number)?.toInt() != ACTION_DENY) return@hookAllBefore
+            val targets = param.args.drop(2).flatMap { arg ->
+                when (arg) {
+                    is String -> if (arg.isNotBlank()) listOf(arg) else emptyList()
+                    is Array<*> -> arg.filterIsInstance<String>().filter { it.isNotBlank() }
+                    else -> emptyList()
+                }
+            }.filter { it in keepSet() }
             if (targets.isEmpty()) return@hookAllBefore
-            logI("keep-autostart: veto PERM_ID_AUTOSTART deny (action=$action) for ${targets.joinToString()}")
-            param.result = null
+            logI("keep-autostart: veto PERM_ID_AUTOSTART deny for ${targets.joinToString()}")
+            param.result = method.defaultResult()
         }
-        logI("keep-autostart deny veto installed (permId=$permIdAutoStart)")
+        logI("keep-autostart deny veto installed")
 
         // Safety net for revocations that never pass through this app (e.g. a direct
-        // framework call from another process): every OnePushJobService run re-grants
-        // action 3 for keep-listed packages.
+        // framework call from another process): every OnePushJobService run checks the
+        // current action through the service's own PermissionUtil and re-grants only
+        // what was actually denied. No blind writes.
         val onePush = findClassOrNull("com.hyperos.security.service.OnePushJobService")
-        if (onePush == null) {
-            logI("keep-autostart: OnePushJobService missing, re-grant watchdog NOT installed")
+        val permissionUtil = findClassOrNull("com.hyperos.security.utility.PermissionUtil")
+        val packageUtil = findClassOrNull("com.hyperos.security.utility.PackageUtil")
+        if (onePush == null || permissionUtil == null || packageUtil == null) {
+            logI("keep-autostart: OnePushJobService/PermissionUtil/PackageUtil missing, watchdog NOT installed")
             return
         }
         onePush.hookAfter("onStartJob", findClass("android.app.job.JobParameters")) { param ->
@@ -193,19 +234,26 @@ class LbeHandler : IHook() {
             val userId = runCatching {
                 Class.forName("android.os.UserHandle").getMethod("myUserId").invoke(null) as Int
             }.getOrDefault(0)
-            logI("keep-autostart: OnePush job, re-granting autostart for ${keep.joinToString()} (user $userId)")
             thread {
                 keep.forEach { pkg ->
                     runCatching {
-                        permManager.callS("getInstance", ctx)
-                            .call("setApplicationPermission", permIdAutoStart, ACTION_ALLOW, userId, pkg)
+                        val info = packageUtil.callS("getPackageInfoAsUser", pkg, 0, userId)
+                            ?: return@runCatching
+                        val current = permissionUtil.callS(
+                            "getPermissionAction", ctx, info, permIdAutoStart
+                        ) as? Number ?: return@runCatching
+                        if (current.toInt() != ACTION_ALLOW) {
+                            logI("keep-autostart: re-grant autostart for $pkg (current=${current.toInt()})")
+                            permManager.callS("getInstance", ctx)
+                                .call("setApplicationPermission", permIdAutoStart, ACTION_ALLOW, userId, pkg)
+                        }
                     }.onFailure {
-                        logE("keep-autostart: re-grant failed for $pkg", it)
+                        logE("keep-autostart: watchdog failed for $pkg", it)
                     }
                 }
             }
         }
-        logI("keep-autostart re-grant watchdog installed")
+        logI("keep-autostart watchdog installed (query-first)")
     }
 
     companion object {
@@ -223,9 +271,8 @@ class LbeHandler : IHook() {
         private const val LEGACY_METHOD_ADD_KEEP = "addAutoStartWhiteList"
         private const val LEGACY_METHOD_REMOVE_KEEP = "removeAutoStartWhiteList"
 
-        /** Framework permission ids: PERM_ID_AUTOSTART (read at runtime; the old
-         *  suggestAccept autostart bit had the same value). */
-        private const val FALLBACK_PERM_ID_AUTOSTART = 16384L
+        /** Framework actions observed in the 4.0.0 service: 3 = allow, 1 = deny. */
         private const val ACTION_ALLOW = 3
+        private const val ACTION_DENY = 1
     }
 }
