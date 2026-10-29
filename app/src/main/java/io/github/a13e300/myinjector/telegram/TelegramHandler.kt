@@ -81,6 +81,12 @@ object TelegramHandler : DynHookManager<TelegramSettings>() {
         subHook(EmojiStickerMenu())
         subHook(CopyPrivateChatLink())
         subHook(SaveSecretImage())
+        subHook(PreciseMessageTime())
+        subHook(FloatingDateTime())
+        subHook(KeepForwardLinkPreview())
+        subHook(CustomDialogsTitle())
+        subHook(IgnoreChatRestriction())
+        subHook(PreciseJoinTime())
         finishDeobf()
     }
 

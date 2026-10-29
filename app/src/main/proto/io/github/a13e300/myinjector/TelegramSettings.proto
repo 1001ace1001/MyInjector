@@ -48,4 +48,11 @@ message TelegramSettings {
   optional bool repeatMessage = 39;
   optional bool addSubItemChannel = 40;
   optional bool addInfoContainer = 41;
+  optional bool preciseMessageTime = 42;
+  optional bool floatingDateTime = 43;
+  optional bool keepForwardLinkPreview = 44;
+  optional bool customDialogsTitle = 45;
+  optional string customDialogsTitleText = 46;
+  optional bool ignoreChatRestriction = 47;
+  optional bool preciseJoinTime = 48;
 }

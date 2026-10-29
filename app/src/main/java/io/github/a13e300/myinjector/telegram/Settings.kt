@@ -28,6 +28,7 @@ import io.github.a13e300.myinjector.ui.ModernInjectedDialogAction
 import io.github.a13e300.myinjector.ui.modernInjectedMessageView
 import io.github.a13e300.myinjector.ui.modernInjectedScrollContent
 import io.github.a13e300.myinjector.ui.showModernInjectedDialog
+import io.github.a13e300.myinjector.ui.showModernInjectedTextInputDialog
 import org.luckypray.dexkit.query.enums.StringMatchType
 import java.lang.reflect.Modifier
 
@@ -162,14 +163,49 @@ class TgSettingsDialog(context: Context) : SettingDialog(context) {
 
             "disableProfileAvatarBlurExtendAvatar" ->
                 settings.disableProfileAvatarBlurExtendAvatar = v
+
+            "preciseMessageTime" ->
+                settings.preciseMessageTime = v
+
+            "floatingDateTime" ->
+                settings.floatingDateTime = v
+
+            "keepForwardLinkPreview" ->
+                settings.keepForwardLinkPreview = v
+
+            "customDialogsTitle" ->
+                settings.customDialogsTitle = v
+
+            "ignoreChatRestriction" ->
+                settings.ignoreChatRestriction = v
+
+            "preciseJoinTime" ->
+                settings.preciseJoinTime = v
         }
         TelegramHandler.updateSettings(settings.build())
         return true
     }
 
+    private fun titleTextSummary(): String =
+        TelegramHandler.settings.customDialogsTitleText.ifEmpty { "未设置（点击输入）" }
+
     override fun onSettingClicked(setting: SettingItem): Boolean {
         if (setting.key == "customEmojiMappingConfig") {
             CustomEmojiMapping.importEmojiMap(activityCtx)
+            return true
+        }
+        if (setting.key == "customDialogsTitleText") {
+            showModernInjectedTextInputDialog(
+                context,
+                "自定义对话列表标题",
+                TelegramHandler.settings.customDialogsTitleText,
+                "留空恢复默认标题",
+            ) { text ->
+                TelegramHandler.updateSettings(
+                    TelegramHandler.settings.toBuilder().setCustomDialogsTitleText(text.trim()).build()
+                )
+                setting.summary = titleTextSummary()
+            }
             return true
         }
         return false
@@ -219,6 +255,26 @@ class TgSettingsDialog(context: Context) : SettingDialog(context) {
                 toggle(
                     "保存私密媒体",
                     "saveSecretMedia"
+                )
+                toggle(
+                    "消息时间精确到秒",
+                    "preciseMessageTime",
+                    "气泡内的发送/编辑时间显示到秒"
+                )
+                toggle(
+                    "浮动日期附加精确时间",
+                    "floatingDateTime",
+                    "滚动时顶部浮动日期后追加当前消息的时间；同时开启「消息时间精确到秒」时显示到秒"
+                )
+                toggle(
+                    "转发时保留链接预览",
+                    "keepForwardLinkPreview",
+                    "隐藏发送者转发时沿用原消息的链接预览（链接、大小图与位置），而非由服务器重新生成"
+                )
+                toggle(
+                    "解除打开对话限制",
+                    "ignoreChatRestriction",
+                    "忽略服务器下发的地区/平台限制，允许打开被限制的用户、群组和频道并显示其消息；不影响敏感内容设置"
                 )
             }
 
@@ -356,8 +412,22 @@ class TgSettingsDialog(context: Context) : SettingDialog(context) {
                     "showExactLastSeenTime",
                 )
                 toggle(
+                    "加入/订阅时间精确到秒",
+                    "preciseJoinTime",
+                    "成员列表、资料页和邀请链接详情中的加入、订阅时间显示到秒"
+                )
+                toggle(
                     "频道显示准确关注人数",
                     "channelDetailNumbers",
+                )
+                toggle(
+                    "自定义对话列表标题",
+                    "customDialogsTitle",
+                    "替换主页顶部的应用名标题，文件夹标签标题不变；重新打开主页生效"
+                )
+                action(
+                    "对话列表标题文本",
+                    "customDialogsTitleText",
                 )
                 toggle(
                     "地图自定义经纬度",
@@ -530,6 +600,26 @@ class TgSettingsDialog(context: Context) : SettingDialog(context) {
                 isChecked = TelegramHandler.settings.disableProfileAvatarBlurExtendAvatar
                 isEnabled = TelegramHandler.settings.disableProfileAvatarBlur
             }
+
+            "preciseMessageTime" -> (setting as ToggleSetting).isChecked =
+                TelegramHandler.settings.preciseMessageTime
+
+            "floatingDateTime" -> (setting as ToggleSetting).isChecked =
+                TelegramHandler.settings.floatingDateTime
+
+            "keepForwardLinkPreview" -> (setting as ToggleSetting).isChecked =
+                TelegramHandler.settings.keepForwardLinkPreview
+
+            "customDialogsTitle" -> (setting as ToggleSetting).isChecked =
+                TelegramHandler.settings.customDialogsTitle
+
+            "customDialogsTitleText" -> setting.summary = titleTextSummary()
+
+            "ignoreChatRestriction" -> (setting as ToggleSetting).isChecked =
+                TelegramHandler.settings.ignoreChatRestriction
+
+            "preciseJoinTime" -> (setting as ToggleSetting).isChecked =
+                TelegramHandler.settings.preciseJoinTime
         }
 
         if (setting.key in TelegramHandler.hookErrors) {
