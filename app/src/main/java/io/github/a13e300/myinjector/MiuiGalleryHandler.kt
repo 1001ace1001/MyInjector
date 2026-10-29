@@ -5,11 +5,10 @@ import android.content.ClipData
 import android.content.Intent
 import android.net.Uri
 import android.content.Context
-import android.preference.Preference
-import android.preference.PreferenceScreen
-import android.preference.SwitchPreference
 import io.github.a13e300.myinjector.arch.DynHookManager
-import io.github.a13e300.myinjector.arch.switchPreference
+import io.github.a13e300.myinjector.ui.settings.SettingItem
+import io.github.a13e300.myinjector.ui.settings.SettingsGroup
+import io.github.a13e300.myinjector.ui.settings.ToggleSetting
 import java.io.InputStream
 import java.io.OutputStream
 import io.github.a13e300.myinjector.arch.call
@@ -65,26 +64,27 @@ object MiuiGalleryHandler : DynHookManager<MiuiGallerySettings>() {
     }
 }
 
-@Suppress("deprecation")
 class MiuiGallerySettingsDialog(ctx: Context) : SettingDialog(ctx) {
-    override fun onPrefChanged(preference: Preference, newValue: Any?): Boolean {
-        if (preference.key != "photoDetails") return false
+    override val dialogTitle = "相册设置"
+
+    override fun onSettingChanged(setting: SettingItem, newValue: Any?): Boolean {
+        if (setting.key != "photoDetails") return false
         MiuiGalleryHandler.updateSettings(
             MiuiGalleryHandler.settings.toBuilder().setPhotoDetails(newValue as Boolean).build()
         )
         return true
     }
 
-    override fun onPrefClicked(preference: Preference): Boolean = false
+    override fun onSettingClicked(setting: SettingItem): Boolean = false
 
-    override fun onRetrievePref(preference: Preference) {
-        if (preference.key == "photoDetails") {
-            (preference as SwitchPreference).isChecked = MiuiGalleryHandler.settings.photoDetails
+    override fun loadSetting(setting: SettingItem) {
+        if (setting.key == "photoDetails") {
+            (setting as ToggleSetting).isChecked = MiuiGalleryHandler.settings.photoDetails
         }
     }
 
-    override fun onCreatePref(prefScreen: PreferenceScreen) {
-        prefScreen.switchPreference(
+    override fun createSettings(settingGroup: SettingsGroup) {
+        settingGroup.toggle(
             "照片预览页显示更多详情", "photoDetails",
             summary = "预览页内显示详情按钮；开启后重新打开照片。读取当前应用已有权限可访问的文件和 EXIF，不申请 root。"
         )
