@@ -168,12 +168,6 @@ class DisableProfileAvatarBlur : MyDynHook("disableProfileAvatarBlur") {
         }
 
         if (originalStyle != null) {
-            runCatching {
-                val paint = readAs<Paint>(actionsViewObj, "actionsPaint")
-                paint.color = originalStyle.paintColor
-                paint.alpha = originalStyle.paintAlpha
-            }
-
             val originalColor = originalStyle.actionsColor
             if (originalColor != null) {
                 runCatching {
@@ -182,6 +176,13 @@ class DisableProfileAvatarBlur : MyDynHook("disableProfileAvatarBlur") {
                 }.also {
                     changingActionsColor = false
                 }
+            }
+
+            // 同理放在 setActionsColor 之后，避免 createColorShader 覆盖缓存的原始画笔。
+            runCatching {
+                val paint = readAs<Paint>(actionsViewObj, "actionsPaint")
+                paint.color = originalStyle.paintColor
+                paint.alpha = originalStyle.paintAlpha
             }
         }
 
@@ -207,16 +208,19 @@ class DisableProfileAvatarBlur : MyDynHook("disableProfileAvatarBlur") {
         }
 
         runCatching {
-            val paint = readAs<Paint>(actionsViewObj, "actionsPaint")
-            paint.color = Color.BLACK
-            paint.alpha = 88
-        }
-
-        runCatching {
             changingActionsColor = true
             setActionsColor(actionsViewObj, Color.WHITE, false)
         }.also {
             changingActionsColor = false
+        }
+
+        // 必须在 setActionsColor 之后设置：exteraGram 的 setActionsColor 为 (int, int, boolean)，
+        // 走字段 + createColorShader 回退路径，hasColorById=false 时 createColorShader 会
+        // paint.setColor(color) 把半透明黑底覆盖成纯白，导致下拉头像后按钮变白块。
+        runCatching {
+            val paint = readAs<Paint>(actionsViewObj, "actionsPaint")
+            paint.color = Color.BLACK
+            paint.alpha = 88
         }
 
         setForcedByUs(actionsViewObj, true)
