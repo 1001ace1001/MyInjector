@@ -2,6 +2,7 @@ package io.github.a13e300.myinjector
 
 import android.app.IActivityManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
@@ -66,19 +67,92 @@ class LawnchairSwipeKill : DynHook() {
     }
 
     private fun forceStop(ctx: Context, pkg: String, user: Int) {
-        runCatching { ams.forceStopPackage(pkg, user) }
-            .onSuccess {
-                logI("force stopped $pkg/$user")
-                toast(ctx, "已停止 $pkg")
-            }
-            .onFailure {
-                logE("forceStopPackage $pkg/$user", it)
-                toast(ctx, "停止 $pkg 失败：${it.javaClass.simpleName}")
-            }
+        // 有 FORCE_STOP_PACKAGES（priv-app 白名单）时直接调用 AMS，否则交给 Lawnchair 的 root shell。
+        val privileged = ctx.checkSelfPermission("android.permission.FORCE_STOP_PACKAGES") ==
+            PackageManager.PERMISSION_GRANTED
+        val result = if (privileged) {
+            runCatching { ams.forceStopPackage(pkg, user) }
+        } else {
+            runCatching { RootShell.forceStop(pkg, user) }
+        }
+        result.onSuccess {
+            logI("force stopped $pkg/$user (${if (privileged) "ams" else "su"})")
+            toast(ctx, "已停止 $pkg")
+        }.onFailure {
+            logE("forceStop $pkg/$user", it)
+            toast(ctx, "停止 $pkg 失败：${it.message ?: it.javaClass.simpleName}")
+        }
     }
 
     private fun toast(ctx: Context, text: String) = main.post {
         runCatching { Toast.makeText(ctx, text, Toast.LENGTH_SHORT).show() }
+    }
+}
+
+/**
+ * Lawnchair 进程内常驻的 su shell。
+ *
+ * 首次划卡时启动 `su`（Magisk/KernelSU 会在此时向 Lawnchair 弹出授权），之后复用同一进程，
+ * 每条命令末尾输出带退出码的结束标记，读到标记即返回。shell 退出（拒绝授权、被杀）时下次重新启动。
+ * 只在 worker 单线程中调用。
+ */
+private object RootShell {
+    private const val END = "__MYINJECTOR_END__"
+    private val PKG = Regex("^[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+$")
+    private var process: Process? = null
+    private var writer: java.io.Writer? = null
+    private var reader: java.io.BufferedReader? = null
+
+    @Synchronized
+    fun forceStop(pkg: String, user: Int) {
+        require(PKG.matches(pkg) && user >= 0) { "非法包名 $pkg/$user" }
+        val (code, output) = exec("am force-stop --user $user $pkg")
+        if (code != 0) error("am force-stop 退出码 $code ${output.trim()}")
+    }
+
+    private fun exec(cmd: String): Pair<Int, String> {
+        repeat(2) { attempt ->
+            val (w, r) = ensure()
+            val out = StringBuilder()
+            try {
+                w.write("$cmd 2>&1; echo $END$?\n")
+                w.flush()
+                while (true) {
+                    val line = r.readLine() ?: break
+                    val idx = line.indexOf(END)
+                    if (idx >= 0) {
+                        out.append(line, 0, idx)
+                        return (line.substring(idx + END.length).trim().toIntOrNull() ?: -1) to out.toString()
+                    }
+                    out.appendLine(line)
+                }
+            } catch (e: java.io.IOException) {
+                if (attempt == 1) throw e
+            }
+            // shell 已退出：可能是未授权 root，或进程被杀；重启一次后再失败即报错。
+            close()
+            if (attempt == 1) error("未获得 root 权限 ${out.trim()}")
+        }
+        error("unreachable")
+    }
+
+    private fun ensure(): Pair<java.io.Writer, java.io.BufferedReader> {
+        val p = process
+        if (p != null && p.isAlive) return writer!! to reader!!
+        close()
+        val np = ProcessBuilder("su").redirectErrorStream(true).start()
+        process = np
+        writer = np.outputStream.bufferedWriter()
+        reader = np.inputStream.bufferedReader()
+        return writer!! to reader!!
+    }
+
+    private fun close() {
+        runCatching { writer?.close() }
+        runCatching { process?.destroy() }
+        process = null
+        writer = null
+        reader = null
     }
 }
 
@@ -121,7 +195,7 @@ class LawnchairSettingsDialog(ctx: Context) : SettingDialog(ctx) {
     override fun createSettings(settingGroup: SettingsGroup) {
         settingGroup.toggle(
             "划卡强杀进程", "swipeKill",
-            summary = "最近任务中划走单张卡片时强行停止该应用（不含全部清除）。需要 Lawnchair 作为 Quickstep 最近任务提供者并持有 FORCE_STOP_PACKAGES 权限。"
+            summary = "最近任务中划走单张卡片时强行停止该应用（不含全部清除）。需要 Lawnchair 作为 Quickstep 最近任务提供者；没有 FORCE_STOP_PACKAGES 时通过 su 执行 am force-stop，首次划卡会请求为 Lawnchair 授予 root。"
         )
     }
 }
