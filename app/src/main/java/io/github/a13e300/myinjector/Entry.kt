@@ -74,6 +74,7 @@ class Entry : XposedModule() {
                 "com.easybrain.sudoku.android" -> SudokuHandler()
                 "com.xingin.xhs" -> XhsHandler
                 "com.miui.gallery" -> MiuiGalleryHandler
+                "app.lawnchair", "app.lawnchair.nightly", "app.lawnchair.debug" -> LawnchairHandler
                 "tv.danmaku.bili" -> BiliHandler()
                 else -> return
             }

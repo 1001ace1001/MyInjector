@@ -1554,6 +1554,9 @@ class SettingsActivity : androidx.activity.ComponentActivity() {
 
         private val APP_PACKAGES = listOf(
             "com.miui.gallery",
+            "app.lawnchair",
+            "app.lawnchair.nightly",
+            "app.lawnchair.debug",
             "com.xingin.xhs",
             "com.kiwibrowser.browser",
             "com.android.chrome",
