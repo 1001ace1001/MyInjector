@@ -1,0 +1,269 @@
+name: Sync upstream
+
+# 作用：定时（或手动）检查上游 5ec1cff/MyInjector 是否有新提交；
+# 有就把上游主线合并进本仓库指定分支，先本地编译验证，通过后再推送，
+# 最后触发 Build 工作流产出 Release APK。
+#
+# 触发方式：
+#   1. 每天定时（见 schedule）
+#   2. 手动 workflow_dispatch
+#   3. 外部 repository_dispatch（type: sync-upstream）
+#
+# 可选仓库变量：SYNC_BRANCHES（逗号分隔，例如 master,lbe-17），不设则只同步 master。
+# 可选仓库密钥：SYNC_TOKEN（PAT）。设了它推送会自然触发 Build；不设则用 GITHUB_TOKEN + 显式 dispatch。
+
+on:
+  schedule:
+    # 每天 03:17 UTC（北京时间 11:17）检查一次
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: '要同步的分支，逗号分隔；留空则用仓库变量 SYNC_BRANCHES，再留空则 master'
+        required: false
+        default: ''
+      upstream_ref:
+        description: '上游分支名'
+        required: false
+        default: 'master'
+      conflict_policy:
+        description: '冲突处理：ours=冲突处保留本仓库改动，theirs=冲突处采用上游，fail=直接失败交人工'
+        required: true
+        type: choice
+        options:
+          - ours
+          - theirs
+          - fail
+        default: ours
+      verify_build:
+        description: '推送前先编译验证（失败则不推送，避免把编译不过的合并推上支线）'
+        required: true
+        type: boolean
+        default: true
+      dry_run:
+        description: '演练：只合并、不编译、不推送、不触发构建'
+        required: true
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [sync-upstream]
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: 5ec1cff/MyInjector
+  UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'master' }}
+  CONFLICT_POLICY: ${{ github.event.inputs.conflict_policy || 'ours' }}
+  VERIFY_BUILD: ${{ github.event.inputs.verify_build || 'true' }}
+  DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+
+jobs:
+  sync:
+    name: Sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: 解析目标分支
+        id: targets
+        run: |
+          set -euo pipefail
+          raw='${{ github.event.inputs.branches }}'
+          if [ -z "${raw// /}" ]; then raw='${{ vars.SYNC_BRANCHES }}'; fi
+          if [ -z "${raw// /}" ]; then raw='master'; fi
+          list=$(printf '%s' "$raw" | tr -d ' ' | tr ',' '\n' | sed '/^$/d' | sort -u | paste -sd, -)
+          echo "branches=$list" >> "$GITHUB_OUTPUT"
+          echo "本次同步分支：$list"
+
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: 准备编译环境
+        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.verify_build != 'false' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: 准备 Gradle
+        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.verify_build != 'false' }}
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 配置 git 身份
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: 添加上游远端并抓取
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "$UPSTREAM_REF"
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*' --prune
+          echo "上游 ${UPSTREAM_REF} = $(git rev-parse --short "upstream/${UPSTREAM_REF}")"
+          echo "上游最新提交：$(git log -1 --format=%s "upstream/${UPSTREAM_REF}")"
+
+          IFS=',' read -ra branches <<< '${{ steps.targets.outputs.branches }}'
+          for b in "${branches[@]}"; do
+            if ! git rev-parse --verify --quiet "refs/remotes/origin/$b" >/dev/null; then
+              echo "::error::本仓库不存在分支 $b"
+              exit 1
+            fi
+          done
+
+      - name: 合并、编译验证并推送
+        id: merge
+        run: |
+          set -euo pipefail
+          : > /tmp/summary.md
+          changed=''
+          failed=''
+
+          IFS=',' read -ra branches <<< '${{ steps.targets.outputs.branches }}'
+
+          for b in "${branches[@]}"; do
+            echo "::group::$b"
+            git checkout -B "$b" "origin/$b"
+            before=$(git rev-parse HEAD)
+
+            # 上游已是本分支祖先 => 没有新东西，直接跳过
+            if git merge-base --is-ancestor "upstream/${UPSTREAM_REF}" HEAD; then
+              echo "$b 已包含上游最新提交，跳过"
+              {
+                echo "### \`$b\`"
+                echo "- 状态：已是最新，无需合并"
+                echo "- HEAD：\`$(git rev-parse --short HEAD)\`"
+                echo
+              } >> /tmp/summary.md
+              echo "::endgroup::"
+              continue
+            fi
+
+            # 先尝试干净合并，冲突时按策略重试一次
+            conflicts=''
+            if ! git merge --no-edit -m "chore(sync): 合并上游 ${UPSTREAM_REPO}@${UPSTREAM_REF} 到 ${b}" \
+                 "upstream/${UPSTREAM_REF}"; then
+              conflicts=$(git diff --name-only --diff-filter=U | paste -sd, -)
+              git merge --abort
+              if [ "$CONFLICT_POLICY" = 'fail' ]; then
+                echo "::error::分支 $b 合并冲突（策略 fail）：${conflicts}"
+                failed+="$b "
+                {
+                  echo "### \`$b\`"
+                  echo "- 状态：**合并冲突，已中止**（策略 fail，未推送）"
+                  echo "- 冲突文件：\`${conflicts//,/\`、\`}\`"
+                  echo
+                } >> /tmp/summary.md
+                echo "::endgroup::"
+                continue
+              fi
+              echo "检测到冲突：${conflicts}"
+              echo "按 -X ${CONFLICT_POLICY} 重试"
+              git merge --no-edit -X "$CONFLICT_POLICY" \
+                -m "chore(sync): 合并上游 ${UPSTREAM_REPO}@${UPSTREAM_REF} 到 ${b}" \
+                "upstream/${UPSTREAM_REF}"
+            fi
+
+            after=$(git rev-parse HEAD)
+            if [ "$before" = "$after" ]; then
+              echo "$b 合并后无变化"
+              echo "::endgroup::"
+              continue
+            fi
+
+            count=$(git rev-list --count "$before..$after")
+
+            # 推送前编译验证：编译不过就丢弃这次合并，绝不污染支线
+            if [ "$DRY_RUN" != 'true' ] && [ "$VERIFY_BUILD" = 'true' ]; then
+              echo "编译验证中……"
+              if ! ./gradlew --no-daemon assembleRelease > /tmp/build.log 2>&1; then
+                echo "::error::分支 $b 合并后编译失败，已放弃本次合并（未推送）"
+                failed+="$b "
+                {
+                  echo "### \`$b\`"
+                  echo "- 状态：**合并后编译失败，已放弃（未推送）**"
+                  echo "- 合并内容：\`$(echo "$before" | cut -c1-7)\` → 待推送的 \`$(echo "$after" | cut -c1-7)\`（上游 ${count} 个提交）"
+                  if [ -n "$conflicts" ]; then
+                    echo "- 冲突文件（按 \`-X ${CONFLICT_POLICY}\` 处理）：\`${conflicts//,/\`、\`}\`"
+                  fi
+                  echo "- 编译日志尾部："
+                  echo '```'
+                  tail -n 40 /tmp/build.log
+                  echo '```'
+                  echo
+                } >> /tmp/summary.md
+                git reset --hard "$before"
+                echo "::endgroup::"
+                continue
+              fi
+              echo "编译通过"
+            fi
+
+            {
+              echo "### \`$b\`"
+              echo "- 状态：已合并$([ "$DRY_RUN" = 'true' ] && echo '（演练，未推送）' || echo '并推送')"
+              echo "- 版本：\`$(echo "$before" | cut -c1-7)\` → \`$(echo "$after" | cut -c1-7)\`，含上游 ${count} 个提交"
+              if [ -n "$conflicts" ]; then
+                echo "- 冲突文件（按 \`-X ${CONFLICT_POLICY}\` 自动处理，**建议复核**）：\`${conflicts//,/\`、\`}\`"
+              fi
+              echo
+            } >> /tmp/summary.md
+
+            if [ "$DRY_RUN" = 'true' ]; then
+              echo "演练模式：不推送 $b"
+            else
+              git push origin "HEAD:refs/heads/$b"
+              changed+="$b "
+            fi
+            echo "::endgroup::"
+          done
+
+          echo "changed=${changed% }" >> "$GITHUB_OUTPUT"
+          echo "failed=${failed% }" >> "$GITHUB_OUTPUT"
+          if [ -n "$failed" ]; then
+            echo "::error::以下分支未完成同步：$failed"
+            exit 1
+          fi
+
+      - name: 写入任务摘要
+        if: always()
+        run: |
+          {
+            echo "## 上游同步报告"
+            echo
+            echo "- 上游：\`${UPSTREAM_REPO}\` / \`${UPSTREAM_REF}\`"
+            echo "- 冲突策略：\`${CONFLICT_POLICY}\`"
+            echo "- 编译验证：\`${VERIFY_BUILD}\`"
+            echo "- 演练模式：\`${DRY_RUN}\`"
+            echo
+            cat /tmp/summary.md 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 触发 Build 工作流
+        if: ${{ success() && steps.merge.outputs.changed != '' && github.event.inputs.dry_run != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          # build.yaml 只监听 master 的 push 和 v* tag；用 PAT 推送时 master 会自动触发编译，
+          # 其他分支以及 GITHUB_TOKEN 推送的情况都不会触发，必须显式 dispatch。
+          pat_used=0
+          if [ -n "${{ secrets.SYNC_TOKEN }}" ]; then pat_used=1; fi
+          IFS=' ' read -ra branches <<< '${{ steps.merge.outputs.changed }}'
+          for b in "${branches[@]}"; do
+            if [ "$pat_used" = '1' ] && [ "$b" = 'master' ]; then
+              echo "$b 由 push 事件自动触发编译，跳过 dispatch"
+              continue
+            fi
+            echo "dispatch build.yaml on $b"
+            gh workflow run build.yaml --ref "$b"
+          done
