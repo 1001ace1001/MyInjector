@@ -164,6 +164,7 @@ def negative_profile(apk, binary, directory, actual):
 def module(apk):
     with zipfile.ZipFile(apk) as archive:
         assert archive.read("META-INF/xposed/native_init.list").strip() == b"libmyinjector_miuihome.so"
+        assert b"targetApiVersion=102" in archive.read("META-INF/xposed/module.prop")
         entry = archive.getinfo("lib/arm64-v8a/libmyinjector_miuihome.so")
         assert entry.compress_type == zipfile.ZIP_STORED
         with Path(apk).open("rb") as stream:

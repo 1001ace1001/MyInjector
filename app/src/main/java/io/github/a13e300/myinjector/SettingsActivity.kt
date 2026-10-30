@@ -3,20 +3,24 @@ package io.github.a13e300.myinjector
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.core.graphics.drawable.toBitmap
+import androidx.core.content.ContextCompat
 import io.github.a13e300.myinjector.ui.InjectorTheme
 import io.github.a13e300.myinjector.ui.settings.AppSettingsDestination
 import io.github.a13e300.myinjector.ui.settings.SettingsApp
 import io.github.a13e300.myinjector.ui.settings.SettingsItemSpec
+import io.github.a13e300.myinjector.scope.ScopeApplication
 import android.annotation.SuppressLint
-import android.app.Dialog
-import android.app.PendingIntent
 import android.content.ClipData
+import android.content.BroadcastReceiver
 import android.content.ClipboardManager
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
@@ -29,6 +33,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PatternMatcher
 import android.text.Editable
 import android.text.InputType
 import android.text.Spannable
@@ -41,8 +46,6 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.view.Window
-import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.AbsListView
 import android.widget.BaseAdapter
@@ -66,23 +69,36 @@ import io.github.a13e300.myinjector.ui.setTextSizeDp
 import io.github.libxposed.service.HookedTarget
 import io.github.libxposed.service.HotReloadResult
 import io.github.libxposed.service.XposedService
-import java.util.Arrays
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
-import java.util.stream.Collectors
 import kotlin.concurrent.thread
 import kotlin.math.min
 
 class SettingsActivity : androidx.activity.ComponentActivity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var palette: ModernSettingsPalette
+    private var scopeState by mutableStateOf(io.github.a13e300.myinjector.scope.ScopeManager.State())
+    private val scopeListener: (io.github.a13e300.myinjector.scope.ScopeManager.State) -> Unit = { scopeState = it }
+    private var appListVersion by mutableStateOf(0)
+    private var syncStatus by mutableStateOf("配置等待同步")
+    private val syncListener: (String) -> Unit = { syncStatus = it }
     private var serviceConnected by mutableStateOf(false)
     private var xposedServiceListener: App.ServiceStateListener? = null
+    private val launcherComponent by lazy { ComponentName(this, LauncherActivity::class.java) }
+    private var launcherIconVisible by mutableStateOf(true)
+    private val launcherStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            refreshLauncherIconVisibility()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        refreshLauncherIconVisibility()
         palette = ModernSettingsPalette.from(this)
-        prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        prefs = App.settings.cache
+        App.settings.addListener(syncListener)
+        App.scopes.addListener(scopeListener)
         enableEdgeToEdge()
         xposedServiceListener = { service ->
             runOnUiThread { serviceConnected = service != null }
@@ -93,11 +109,16 @@ class SettingsActivity : androidx.activity.ComponentActivity() {
                 SettingsApp(
                     prefs = prefs,
                     serviceConnected = serviceConnected,
+                    launcherIconVisible = launcherIconVisible,
+                    onLauncherIconToggle = ::changeLauncherIconVisibility,
+                    syncStatus = syncStatus,
+                    scopeState = scopeState,
+                    onScopeToggle = App.scopes::setEnabled,
+                    appListVersion = appListVersion,
                     loadApps = ::loadAppDestinations,
                     openApp = ::openAppSettings,
                     onToggle = { item, checked ->
-                        prefs.edit().putBoolean(item.key, checked).apply()
-                        commitForSection(item.sectionKey)
+                        App.settings.putBoolean(item.key, checked)
                     },
                     onEdit = { item ->
                         if (item.key == "clipboardWhitelistPackages") showClipboardWhitelistDialog(item)
@@ -108,11 +129,11 @@ class SettingsActivity : androidx.activity.ComponentActivity() {
                 )
             }
         }
-        // 保留已启用桌面选项向 HYOS 桥接的迁移。
-        commitMiuiHome()
     }
 
     override fun onDestroy() {
+        App.scopes.removeListener(scopeListener)
+        App.settings.removeListener(syncListener)
         xposedServiceListener?.let(App::removeServiceStateListener)
         super.onDestroy()
     }
@@ -308,8 +329,7 @@ class SettingsActivity : androidx.activity.ComponentActivity() {
             actions = listOf(
                 ModernDialogAction("取消"),
                 ModernDialogAction("保存", emphasized = true) {
-                    prefs.edit().putString(item.key, entries.joinToString("\n")).apply()
-                    commitForSection(item.sectionKey)
+                    App.settings.putString(item.key, entries.joinToString("\n"))
                 },
             ),
         )
@@ -542,10 +562,7 @@ class SettingsActivity : androidx.activity.ComponentActivity() {
             actions = listOf(
                 ModernDialogAction("取消"),
                 ModernDialogAction("保存", emphasized = true) {
-                    prefs.edit()
-                        .putString(item.key, sortedClipboardPackages(entries, selectedPackages))
-                        .apply()
-                    commitForSection(item.sectionKey)
+                    App.settings.putString(item.key, sortedClipboardPackages(entries, selectedPackages))
                 },
             ),
         )
@@ -629,28 +646,71 @@ class SettingsActivity : androidx.activity.ComponentActivity() {
     private fun handleAction(item: SettingsItemSpec.Action) {
         when (item.key) {
             "checkHotUpdate" -> showHotUpdateDialog()
-            "commit" -> commitSystem()
-            "commitSysUI" -> commitSystemUI()
             else -> item.action?.invoke()
         }
     }
 
-    private fun commitForSection(sectionKey: String) {
-        when (sectionKey) {
-            "system" -> commitSystem()
-            "systemui" -> commitSystemUI()
-            "miuihome" -> commitMiuiHome()
+    override fun onStart() {
+        super.onStart()
+        val filter = IntentFilter(Intent.ACTION_PACKAGE_CHANGED).apply {
+            addDataScheme("package")
+            addDataSchemeSpecificPart(packageName, PatternMatcher.PATTERN_LITERAL)
+        }
+        ContextCompat.registerReceiver(this, launcherStateReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        // 注册后读取，补齐不可见期间的变更，并避免首次查询与注册之间丢失更新。
+        refreshLauncherIconVisibility()
+    }
+
+    override fun onStop() {
+        unregisterReceiver(launcherStateReceiver)
+        super.onStop()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        App.scopes.refresh()
+        appListVersion++
+    }
+
+    /** 组件状态是唯一数据源；DEFAULT 按 manifest 的声明解析，不另外保存开关偏好。 */
+    private fun refreshLauncherIconVisibility() {
+        launcherIconVisible = when (packageManager.getComponentEnabledSetting(launcherComponent)) {
+            PackageManager.COMPONENT_ENABLED_STATE_DEFAULT ->
+                packageManager.getActivityInfo(launcherComponent, PackageManager.MATCH_DISABLED_COMPONENTS).enabled
+            PackageManager.COMPONENT_ENABLED_STATE_ENABLED -> true
+            else -> false
         }
     }
 
-    private fun loadAppDestinations(): List<AppSettingsDestination> = APP_PACKAGES.mapNotNull { pkg ->
+    private fun changeLauncherIconVisibility(visible: Boolean) {
         runCatching {
-            val info = packageManager.getApplicationInfo(pkg, 0)
-            AppSettingsDestination(
-                pkg, info.loadLabel(packageManager),
-                info.loadIcon(packageManager).toBitmap(96, 96).asImageBitmap(),
-            )
-        }.getOrNull()
+            packageManager.setComponentEnabledSetting(launcherComponent,
+                if (visible) PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+                else PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                PackageManager.DONT_KILL_APP)
+        }.onFailure {
+            logE("failed to change launcher icon visibility:", it)
+            Toast.makeText(this, "无法修改桌面图标状态：${it.message}", Toast.LENGTH_LONG).show()
+        }
+        refreshLauncherIconVisibility()
+    }
+
+    private fun loadAppDestinations(): List<AppSettingsDestination> {
+        val catalog = io.github.a13e300.myinjector.scope.ScopeCatalog
+        val packages = checkNotNull(javaClass.classLoader!!.getResourceAsStream("META-INF/xposed/scope.list"))
+            .bufferedReader().use { catalog.applications(it.lineSequence()) }
+        return packages.mapNotNull { pkg ->
+            try {
+                val info = packageManager.getApplicationInfo(catalog.applicationPackage(pkg), 0)
+                if (info.flags and ApplicationInfo.FLAG_INSTALLED == 0) return@mapNotNull null
+                AppSettingsDestination(
+                    ScopeApplication(pkg,
+                        if (pkg == "system") "系统框架" else info.loadLabel(packageManager).toString(),
+                        catalog.isSystemApp(info.flags)),
+                    info.loadIcon(packageManager).toBitmap(96, 96).asImageBitmap(),
+                )
+            } catch (_: PackageManager.NameNotFoundException) { null }
+        }.sortedWith(compareBy(catalog.applicationOrder) { it.app })
     }
 
     private fun openAppSettings(packageName: String) {
@@ -667,172 +727,6 @@ class SettingsActivity : androidx.activity.ComponentActivity() {
             logE("failed to open settings for $packageName:", it)
             Toast.makeText(this, "无法打开应用设置：${it.message}", Toast.LENGTH_LONG).show()
         }
-    }
-
-    private fun commitSystem() {
-        val intent = Intent("io.github.a13e300.myinjector.UPDATE_SYSTEM_CONFIG")
-        val pendingIntent =
-            PendingIntent.getBroadcast(this, 1, intent, PendingIntent.FLAG_IMMUTABLE)
-        val config = SystemServerConfig.newBuilder()
-            .setNoWakePath(prefs.getBoolean("noWakePath", false))
-            .setNoMiuiIntent(prefs.getBoolean("noMiuiIntent", false))
-            .setClipboardWhitelist(prefs.getBoolean("clipboardWhitelist", false))
-            .setFixSync(prefs.getBoolean("fixSync", false))
-            .setXSpace(prefs.getBoolean("xSpace", false))
-            .setBypassShellDexOptRestriction(
-                prefs.getBoolean(
-                    "bypassShellDexOptRestriction",
-                    false,
-                )
-            )
-            .setNoSwipeToKillLockedProcess(prefs.getBoolean("noSwipeToKillLockedProcess", false))
-            .setNoSwipeToKillNoRestrictProcess(
-                prefs.getBoolean(
-                    "noSwipeToKillNoRestrictProcess",
-                    false,
-                )
-            )
-            .setFixHyperOSAvoidMoveToFromt(
-                prefs.getBoolean(
-                    "fixHyperOSAvoidMoveToFront",
-                    false,
-                )
-            )
-            .addAllClipboardWhitelistPackages(
-                Arrays.stream<String?>(
-                    prefs.getString("clipboardWhitelistPackages", "")!!.trim { it <= ' ' }
-                        .split("\n".toRegex()).dropLastWhile { it.isEmpty() }.toTypedArray()
-                )
-                    .collect(
-                        Collectors.toList()
-                    )
-            )
-            .setForceNewTask(prefs.getBoolean("forceNewTask", false))
-            .addAllForceNewTaskRules(
-                Arrays.stream<String?>(
-                    prefs.getString(
-                        "forceNewTaskRules",
-                        "",
-                    )!!.trim { it <= ' ' }.split("\n".toRegex()).dropLastWhile { it.isEmpty() }
-                        .toTypedArray()
-                ).map<NewTaskRule?> { x: String? ->
-                    val parts: Array<String?> =
-                        x!!.split(":".toRegex()).dropLastWhile { it.isEmpty() }.toTypedArray()
-                    var ignoreResult = false
-                    var useNewDoc = false
-                    if (parts.size == 3) {
-                        val options: Array<String?> =
-                            parts[2]!!.split(",".toRegex()).dropLastWhile { it.isEmpty() }
-                                .toTypedArray()
-                        for (o in options) {
-                            if ("ir" == o) {
-                                ignoreResult = true
-                            } else if ("nd" == o) {
-                                useNewDoc = true
-                            }
-                        }
-                    } else if (parts.size != 2) return@map null
-                    var sourcePackage: String = parts[0]!!
-                    var targetPackage: String = parts[1]!!
-                    var sourceComponent = ""
-                    var targetComponent = ""
-                    if (sourcePackage.contains("/")) {
-                        val l: Array<String?> =
-                            sourcePackage.split("/".toRegex()).dropLastWhile { it.isEmpty() }
-                                .toTypedArray()
-                        if (l.size == 2) {
-                            sourcePackage = l[0]!!
-                            sourceComponent = l[1]!!
-                            if (sourceComponent.startsWith(".")) sourceComponent = l[0] + l[1]
-                        }
-                    }
-                    if (targetPackage.contains("/")) {
-                        val l: Array<String?> =
-                            targetPackage.split("/".toRegex()).dropLastWhile { it.isEmpty() }
-                                .toTypedArray()
-                        if (l.size == 2) {
-                            targetPackage = l[0]!!
-                            targetComponent = l[1]!!
-                            if (targetComponent.startsWith(".")) targetComponent = l[0] + l[1]
-                        }
-                    }
-                    NewTaskRule.newBuilder()
-                        .setSourcePackage(sourcePackage)
-                        .setTargetPackage(targetPackage)
-                        .setSourceComponent(sourceComponent)
-                        .setTargetComponent(targetComponent)
-                        .setUseNewDocument(useNewDoc)
-                        .setIgnoreResult(ignoreResult)
-                        .build()
-                }.filter { it != null }.collect(Collectors.toList())
-            )
-            .setOverrideStatusBar(prefs.getBoolean("overrideStatusBar", false))
-            .addAllOverrideStatusBarRules(
-                Arrays.stream<String?>(
-                    prefs.getString("overrideStatusBarRules", "")!!
-                        .trim { it <= ' ' }
-                        .split("\n".toRegex()).dropLastWhile { it.isEmpty() }.toTypedArray()
-                ).map<OverrideStatusBarRule?> { x: String? ->
-                    val parts: Array<String?> =
-                        x!!.split(":".toRegex()).dropLastWhile { it.isEmpty() }.toTypedArray()
-                    if (parts.size != 2) return@map null
-                    var pkg: String = parts[0]!!
-                    var light = false
-                    if ("light" == parts[1]) {
-                        light = true
-                    } else if ("dark" != parts[1]) {
-                        return@map null
-                    }
-                    var component = ""
-                    val pkgSplit: Array<String?> =
-                        pkg.split("/".toRegex()).dropLastWhile { it.isEmpty() }.toTypedArray()
-                    if (pkgSplit.size == 2) {
-                        pkg = pkgSplit[0]!!
-                        component = pkgSplit[1]!!
-                        if (component.startsWith(".")) component = pkg + component
-                    } else if (pkgSplit.size != 1) return@map null
-                    OverrideStatusBarRule.newBuilder()
-                        .setPackage(pkg)
-                        .setComponent(component)
-                        .setLight(light)
-                        .build()
-                }.filter { it != null }.collect(Collectors.toList())
-            )
-            .setForceNewTaskDebug(prefs.getBoolean("forceNewTaskDebug", false))
-            .build()
-        intent.putExtra("EXTRA_CREDENTIAL", pendingIntent)
-        intent.putExtra("EXTRA_CONFIG", config.toByteArray())
-        sendBroadcast(intent)
-    }
-
-    private fun commitSystemUI() {
-        val intent = Intent("io.github.a13e300.myinjector.UPDATE_SYSTEMUI_CONFIG")
-        val pendingIntent =
-            PendingIntent.getBroadcast(this, 1, intent, PendingIntent.FLAG_IMMUTABLE)
-        val config = SystemUIConfig.newBuilder()
-            .setAlwaysExpandNotification(prefs.getBoolean("alwaysExpandNotification", false))
-            .setNoDndNotification(prefs.getBoolean("noDndNotification", false))
-            .setShowNotificationDetail(prefs.getBoolean("showNotificationDetail", false))
-            .setFixWhiteSplash(prefs.getBoolean("fixWhiteSplash", false))
-            .build()
-        intent.putExtra("EXTRA_CREDENTIAL", pendingIntent)
-        intent.putExtra("EXTRA_CONFIG", config.toByteArray())
-        sendBroadcast(intent)
-    }
-
-    private fun commitMiuiHome() {
-        val intent = Intent("io.github.a13e300.myinjector.UPDATE_MIUI_HOME_CONFIG")
-        val pendingIntent =
-            PendingIntent.getBroadcast(this, 1, intent, PendingIntent.FLAG_IMMUTABLE)
-        val config = MiuiHomeConfig.newBuilder()
-            .setOpenAospSettings(prefs.getBoolean("miuiHomeOpenAospSettings", false))
-            .setDragKill(prefs.getBoolean("miuiHomeDragKill", false))
-            .setDisablePreLaunch(prefs.getBoolean("miuiHomeDisablePreLaunch", false))
-            .build()
-        intent.putExtra("EXTRA_CREDENTIAL", pendingIntent)
-        intent.putExtra("EXTRA_CONFIG", config.toByteArray())
-        sendBroadcast(Intent(intent).setPackage("com.miui.home"))
-        sendBroadcast(Intent(intent).setPackage("android"))
     }
 
     @SuppressLint("SetTextI18n", "XposedNewApi")
@@ -1546,7 +1440,6 @@ class SettingsActivity : androidx.activity.ComponentActivity() {
     }
 
     companion object {
-        private const val PREFS_NAME = "system_server"
 
         private var clipboardAppEntryCache: List<ClipboardAppEntry>? = null
         private val clipboardIconCache = java.util.concurrent.ConcurrentHashMap<String, Drawable>()

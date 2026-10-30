@@ -77,3 +77,52 @@ python3 scripts/check_settings_ui.py --serial emulator-5554 --service-state-only
 导航容器裁剪越界内容，不执行额外的尺寸动画；保留原有页面保存状态与系统动画缩放行为。未新增动画库，也未改动其他窗口。
 
 Android 15 模拟器已通过模块导航、持久化、搜索和编辑入口回归，以及按钮返回、左右侧手势返回、手势取消检查。录屏及事件时间位于 `app/build/reports/navigation-motion/`，已检查过渡中间帧；debug 构建与 4 个单元测试通过。
+
+## 状态栏与软键盘避让
+
+模块设置页保持 edge-to-edge。导航栈外层消费横向 safeDrawing 边距，
+顶部 safeDrawing 由 Material 3 TopAppBar 自身消费：背景覆盖状态栏，标题文字与返回按钮避开状态栏和刘海。
+展开、折叠及提起态的背景色均由同一个 TopAppBar 绘制，避免顶部出现页面底色与标题栏的色带分界。
+Scaffold 使用底部 safeDrawing（包含 IME）计算内容 PaddingValues，内容根节点应用并消费
+这些边距，使列表视口随键盘缩小，底部导航栏与键盘边距不累加。Activity 显式使用
+adjustResize，避免系统平移整个窗口时把标题推到状态栏后面。
+
+仅修改模块 Activity 的布局，不改变注入弹窗及其他窗口。复用 Compose WindowInsets，
+不监听键盘高度或手工计算状态栏像素。回归命令：
+
+```sh
+python3 scripts/check_settings_ui.py --serial emulator-5556 --insets-only
+```
+
+已在模拟器验证首页、系统框架二级页的键盘避让、关闭后的高度恢复、
+键盘展开时折叠标题及返回导航。测试直接比较列表、标题文字与系统 Insets 的边界，同时确认标题栏背景从窗口顶部开始绘制，
+截图保存在 app/build/reports/ui-smoke/insets-*.png。
+x86_64 模拟器使用移除 arm64 native 库后重新签名的临时 debug 测试包；交付包保持完整 release。
+
+## 搜索栏吸顶
+
+模块首页与二级设置页使用 Compose `LazyColumn.stickyHeader`：搜索栏随列表上移，
+到折叠标题栏下方后固定。搜索栏使用页面底色遮挡从下方滚过的内容，保留上下留白、
+原有搜索状态和键盘避让。注入弹窗不受影响。
+
+`check_settings_ui.py --sticky-search-only` 使用 debug 测试 Activity 的长列表验证两个页面从初始位置滚动吸顶、
+继续滚动时位置不变，以及吸顶后的搜索与清除操作；`--insets-only` 回归键盘布局。
+
+## 桌面图标显示开关
+
+首页状态卡片下方的“显示桌面图标”直接读取、修改桌面入口 Activity 的组件启用状态，
+不写入 Hook 配置或额外偏好。默认按 manifest 启用，切换后立即读回实际状态。
+Activity 可见时动态监听当前包的 PACKAGE_CHANGED 广播，收到后重新读取桌面组件状态；
+使用非导出的接收器，按 package 数据 URI 精确过滤本应用。onStart 注册后补读，onStop 注销，
+既覆盖前台外部变更，也补齐不可见期间的变更。
+
+桌面 MAIN/LAUNCHER 入口直接由无界面、使用独立任务的 LauncherActivity 提供，再打开 SettingsActivity；
+SettingsActivity 保留框架 MODULE_SETTINGS 入口。不再使用 activity-alias，也不保留旧组件名或迁移逻辑。
+使用 DONT_KILL_APP 切换桌面组件，隐藏图标时保留当前设置页，仍可通过框架打开模块设置。
+
+`check_settings_ui.py --launcher-icon-only` 验证默认入口唯一、图标显示／隐藏、切换时进程保留、
+重启及外部组件状态同步，并确认框架设置入口始终可用。debug 的 LauncherStateTestReceiver
+通过 PM 修改桌面组件并触发真实系统广播，验证前台开关实时刷新且 Activity 实例、进程保持不变；
+该测试接收器不进入 release APK。
+Android 16 模拟器需先执行 `adb -s <serial> root`，以允许脚本通过 shell 模拟外部组件状态变更；
+模块自身切换桌面组件无需 root 或额外权限。

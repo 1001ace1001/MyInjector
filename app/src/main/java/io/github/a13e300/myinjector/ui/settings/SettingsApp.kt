@@ -11,6 +11,9 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
+import io.github.a13e300.myinjector.scope.ScopeManager
+import io.github.a13e300.myinjector.scope.ScopeCatalog
+import io.github.a13e300.myinjector.scope.ScopeApplication
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -24,10 +27,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.text.font.FontWeight
@@ -44,8 +47,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 internal data class AppSettingsDestination(
-    val packageName: String,
-    val label: CharSequence,
+    val app: ScopeApplication,
     val icon: ImageBitmap,
 )
 
@@ -54,6 +56,12 @@ internal data class AppSettingsDestination(
 internal fun SettingsApp(
     prefs: SharedPreferences,
     serviceConnected: Boolean,
+    launcherIconVisible: Boolean = true,
+    onLauncherIconToggle: (Boolean) -> Unit = {},
+    syncStatus: String = "",
+    scopeState: ScopeManager.State = ScopeManager.State(),
+    onScopeToggle: (String, Boolean) -> Unit = { _, _ -> },
+    appListVersion: Int = 0,
     loadApps: () -> List<AppSettingsDestination>,
     openApp: (String) -> Unit,
     onToggle: (SettingsItemSpec.Switch, Boolean) -> Unit,
@@ -64,16 +72,24 @@ internal fun SettingsApp(
     val sections = remember { moduleSettingsSections() }
     // Navigation 3 按返回栈缓存 NavEntry；页面必须读取 State，避免捕获首次连接值。
     val currentServiceConnected by rememberUpdatedState(serviceConnected)
+    val currentLauncherIconVisible by rememberUpdatedState(launcherIconVisible)
+    val currentLauncherIconToggle by rememberUpdatedState(onLauncherIconToggle)
+    val currentSyncStatus by rememberUpdatedState(syncStatus)
+    val currentScope by rememberUpdatedState(scopeState)
+    val currentScopeToggle by rememberUpdatedState(onScopeToggle)
     val direction = if (LocalLayoutDirection.current == LayoutDirection.Ltr) 1 else -1
     var routes by rememberSaveable { mutableStateOf(listOf("home")) }
-    val apps by produceState<List<AppSettingsDestination>?>(null) {
+    val apps by produceState<List<AppSettingsDestination>?>(null, appListVersion) {
         value = withContext(Dispatchers.IO) { loadApps() }
     }
     fun navigateBack() { if (routes.size > 1) routes = routes.dropLast(1) else onClose() }
 
     NavDisplay(
         backStack = routes, onBack = ::navigateBack,
-        modifier = Modifier.fillMaxSize().clipToBounds().background(MaterialTheme.colorScheme.background)
+        // 横向避开刘海；顶部交给标题栏，让其背景覆盖状态栏、文字仍处于安全区。
+        modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
+            .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
+            .clipToBounds()
             .semantics { testTagsAsResourceId = true },
         sizeTransform = null,
         transitionSpec = { settingsPageTransition(true, direction) },
@@ -84,32 +100,49 @@ internal fun SettingsApp(
         entryProvider = { route ->
             NavEntry(route) {
                 val section = sections.firstOrNull { it.key == route }
+                val packageName = ScopeCatalog.components[route]
+                val destination = apps?.firstOrNull { it.app.packageName == packageName }
+                val isHome = route == "home"
+                val title = if (isHome) "MyInjector" else destination?.app?.label ?: section?.title?.toString().orEmpty()
                 val behavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
                 Scaffold(
                     modifier = Modifier.nestedScroll(behavior.nestedScrollConnection),
+                    // safeDrawing 包含 IME；列表的可用高度随键盘变化，底部取最大值而非重复累加。
+                    contentWindowInsets = WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom),
                     topBar = {
                         LargeTopAppBar(
-                            title = { Text(section?.title?.toString() ?: "MyInjector", fontWeight = FontWeight.Bold) },
+                            modifier = Modifier.testTag("settings_top_bar"),
+                            title = { Text(title, fontWeight = FontWeight.Bold) },
                             navigationIcon = {
-                                if (section != null) {
+                                if (!isHome) {
                                     IconButton(onClick = ::navigateBack) {
                                         Icon(MaterialSymbols.RoundedFilled.Arrow_back, "返回首页")
                                     }
                                 }
                             },
                             scrollBehavior = behavior,
+                            windowInsets = WindowInsets.safeDrawing.only(WindowInsetsSides.Top),
                         )
                     },
                 ) { padding ->
-                    Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.TopCenter) {
-                        if (section == null) {
+                    Box(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding), contentAlignment = Alignment.TopCenter) {
+                        if (isHome) {
                             HomePage(
-                                sections, apps, currentServiceConnected,
-                                onOpenSection = { routes = routes + it },
+                                apps, currentServiceConnected, currentSyncStatus, currentScope, currentScopeToggle,
+                                launcherIconVisible = currentLauncherIconVisible,
+                                onLauncherIconToggle = currentLauncherIconToggle,
+                                onOpenModuleSettings = { routes = routes + it },
                                 onOpenApp = openApp,
                                 onUpdate = { onAction(sections.first { it.key == "hotreload" }.items.single() as SettingsItemSpec.Action) },
                             )
-                        } else SectionPage(section, prefs, onToggle, onEdit, onAction)
+                        } else if (destination != null && section != null) {
+                            SectionPage(destination.app, section, prefs, onToggle, onEdit, onAction,
+                                currentScope, currentScopeToggle, openApp)
+                        } else if (apps == null) {
+                            CircularProgressIndicator(Modifier.padding(24.dp))
+                        } else {
+                            Text("此应用已卸载或不再可用", Modifier.padding(24.dp))
+                        }
                     }
                 }
             }
@@ -132,16 +165,19 @@ private fun settingsPageTransition(forward: Boolean, direction: Int): ContentTra
 
 @Composable
 private fun HomePage(
-    sections: List<SettingsSectionSpec>, apps: List<AppSettingsDestination>?, connected: Boolean,
-    onOpenSection: (String) -> Unit, onOpenApp: (String) -> Unit, onUpdate: () -> Unit,
+    apps: List<AppSettingsDestination>?, connected: Boolean, syncStatus: String,
+    scope: ScopeManager.State, onScopeToggle: (String, Boolean) -> Unit,
+    launcherIconVisible: Boolean, onLauncherIconToggle: (Boolean) -> Unit,
+    onOpenModuleSettings: (String) -> Unit, onOpenApp: (String) -> Unit, onUpdate: () -> Unit,
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     val normalized = query.trim()
-    val components = sections.filter { it.key != "hotreload" &&
-        (it.title.contains(normalized, true) || sectionPackage(it.key).contains(normalized, true)) }
     val visibleApps = apps.orEmpty().filter {
-        it.label.contains(normalized, true) || it.packageName.contains(normalized, true)
+        it.app.label.contains(normalized, true) || it.app.packageName.contains(normalized, true) ||
+            ScopeCatalog.applicationPackage(it.app.packageName).contains(normalized, true)
     }
+    val components = visibleApps.filter { it.app.isSystemApp }
+    val applications = visibleApps.filterNot { it.app.isSystemApp }
     LazyColumn(
         modifier = Modifier.widthIn(max = 840.dp).fillMaxWidth().testTag("settings_home"),
         contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 28.dp),
@@ -156,6 +192,8 @@ private fun HomePage(
                         if (connected) "模块服务已连接 · 按应用管理你的设置" else "模块服务未连接 · 请在框架中启用模块",
                         style = MaterialTheme.typography.bodyMedium,
                     )
+                    Text(syncStatus, style = MaterialTheme.typography.bodySmall)
+                    Text(scope.message, style = MaterialTheme.typography.bodySmall)
                     FilledTonalButton(onClick = onUpdate, modifier = Modifier.testTag("hot_update")) {
                         Icon(MaterialSymbols.RoundedFilled.System_update, null, Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
@@ -166,34 +204,84 @@ private fun HomePage(
             }
             Spacer(Modifier.height(16.dp))
         }
-        item("search") { SettingsSearchField(query, { query = it }, "搜索应用或系统组件") }
-        if (components.isNotEmpty()) {
-            item("components_label") { SectionLabel("系统组件") }
-            itemsIndexed(components, key = { _, it -> it.key }) { index, section ->
-                DestinationCard(
-                    section.title.toString(), sectionPackage(section.key), sectionIcon(section.key),
-                    index == 0, index == components.lastIndex,
-                    onClick = { onOpenSection(section.key) },
-                )
+        item("launcher_icon") {
+            SettingRow("显示桌面图标", "关闭后仍可从框架打开模块设置", checked = launcherIconVisible) {
+                onLauncherIconToggle(!launcherIconVisible)
             }
         }
-        item("apps_label") { SectionLabel("应用设置") }
+        stickyHeader(key = "search") {
+            SettingsSearchHeader(query, { query = it }, "搜索应用或系统组件")
+        }
         if (apps == null) {
             item("loading") { LinearProgressIndicator(Modifier.fillMaxWidth().padding(16.dp)) }
         } else if (visibleApps.isEmpty()) {
             item("empty") {
                 Text(
-                    if (query.isBlank()) "尚未安装带有设置入口的应用" else "没有匹配的应用",
+                    if (query.isBlank()) "尚未安装作用域列表中的应用" else "没有匹配的应用",
                     Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         } else {
-            itemsIndexed(visibleApps, key = { _, it -> it.packageName }) { index, app ->
-                DestinationCard(
-                    app.label.toString(), app.packageName, MaterialSymbols.RoundedFilled.Apps,
-                    index == 0, index == visibleApps.lastIndex, app.icon,
-                    onClick = { onOpenApp(app.packageName) },
-                )
+            if (components.isNotEmpty()) {
+                item("components_label") { SectionLabel("系统组件") }
+                itemsIndexed(components, key = { _, it -> it.app.packageName }) { index, destination ->
+                    AppScopeCard(destination, scope, onScopeToggle, onOpenApp, onOpenModuleSettings,
+                        index == 0, index == components.lastIndex)
+                }
+            }
+            if (applications.isNotEmpty()) {
+                item("apps_label") { SectionLabel("应用作用域") }
+                itemsIndexed(applications, key = { _, it -> it.app.packageName }) { index, destination ->
+                    AppScopeCard(destination, scope, onScopeToggle, onOpenApp, onOpenModuleSettings,
+                        index == 0, index == applications.lastIndex)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AppScopeCard(
+    destination: AppSettingsDestination, scope: ScopeManager.State,
+    onToggle: (String, Boolean) -> Unit, onSettings: (String) -> Unit, onOpenModuleSettings: (String) -> Unit,
+    first: Boolean, last: Boolean,
+) {
+    val app = destination.app
+    val sectionKey = app.sectionKey
+    if (sectionKey != null) {
+        DestinationCard(destination, first, last) { onOpenModuleSettings(sectionKey) }
+        return
+    }
+    val checked = app.packageName in scope.enabled
+    val pending = app.packageName in scope.pending
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        shape = RoundedCornerShape(topStart = if (first) 28.dp else 4.dp,
+            topEnd = if (first) 28.dp else 4.dp, bottomStart = if (last) 28.dp else 4.dp,
+            bottomEnd = if (last) 28.dp else 4.dp),
+    ) {
+        Column {
+            ListItem(
+                content = { Text(app.label, style = MaterialTheme.typography.titleMedium) },
+                supportingContent = { Text(app.packageName) },
+                leadingContent = { Image(destination.icon, null, Modifier.size(44.dp)) },
+                trailingContent = {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Switch(checked, { onToggle(app.packageName, it) },
+                            enabled = scope.ready && scope.pending.isEmpty(),
+                            modifier = Modifier.testTag("scope_${app.packageName}")
+                                .semantics { contentDescription = "${app.label}作用域" })
+                        if (pending) Text("处理中", style = MaterialTheme.typography.labelSmall)
+                    }
+                },
+                colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
+            )
+            if (app.hasSettings) TextButton(onClick = { onSettings(app.packageName) },
+                modifier = Modifier.align(Alignment.End).padding(end = 12.dp, bottom = 4.dp)) {
+                Icon(MaterialSymbols.RoundedFilled.Settings, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("应用内设置")
             }
         }
     }
@@ -201,8 +289,7 @@ private fun HomePage(
 
 @Composable
 private fun DestinationCard(
-    title: String, summary: String, icon: ImageVector, first: Boolean, last: Boolean,
-    appIcon: ImageBitmap? = null, onClick: () -> Unit,
+    destination: AppSettingsDestination, first: Boolean, last: Boolean, onClick: () -> Unit,
 ) {
     Card(
         onClick = onClick, modifier = Modifier.fillMaxWidth(),
@@ -213,14 +300,9 @@ private fun DestinationCard(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
     ) {
         ListItem(
-            content = { Text(title, style = MaterialTheme.typography.titleMedium) },
-            supportingContent = { Text(summary) },
-            leadingContent = {
-                if (appIcon != null) Image(appIcon, null, Modifier.size(44.dp))
-                else Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
-                    Icon(icon, null, Modifier.padding(12.dp).size(24.dp))
-                }
-            },
+            content = { Text(destination.app.label, style = MaterialTheme.typography.titleMedium) },
+            supportingContent = { Text(ScopeCatalog.applicationPackage(destination.app.packageName)) },
+            leadingContent = { Image(destination.icon, null, Modifier.size(44.dp)) },
             trailingContent = { Icon(MaterialSymbols.RoundedFilled.Chevron_right, null) },
             colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
         )
@@ -229,9 +311,10 @@ private fun DestinationCard(
 
 @Composable
 private fun SectionPage(
-    section: SettingsSectionSpec, prefs: SharedPreferences,
+    app: ScopeApplication, section: SettingsSectionSpec, prefs: SharedPreferences,
     onToggle: (SettingsItemSpec.Switch, Boolean) -> Unit,
     onEdit: (SettingsItemSpec.Text) -> Unit, onAction: (SettingsItemSpec.Action) -> Unit,
+    scope: ScopeManager.State, onScopeToggle: (String, Boolean) -> Unit, onOpenApp: (String) -> Unit,
 ) {
     var revision by remember { mutableIntStateOf(0) }
     DisposableEffect(prefs) {
@@ -251,14 +334,29 @@ private fun SectionPage(
     ) {
         item("description") {
             Text(
-                sectionPackage(section.key) + if (section.key == "miuihome") " · 修改会自动同步到桌面" else " · 修改自动同步，也可在页末手动提交",
+                ScopeCatalog.applicationPackage(app.packageName) + " · 修改自动同步，未连接时将在连接后补交",
                 Modifier.padding(bottom = 16.dp), style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        item("search") {
-            SettingsSearchField(query, { query = it }, "搜索此页设置")
+        item("scope") {
+            val packageName = app.packageName
+            SettingRow("启用作用域", scope.message,
+                checked = packageName in scope.enabled,
+                enabled = scope.ready && scope.pending.isEmpty()) {
+                onScopeToggle(packageName, packageName !in scope.enabled)
+            }
             Spacer(Modifier.height(12.dp))
+        }
+        if (app.hasSettings) item("app_settings") {
+            TextButton(onClick = { onOpenApp(app.packageName) }) {
+                Icon(MaterialSymbols.RoundedFilled.Settings, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("应用内设置")
+            }
+        }
+        stickyHeader(key = "search") {
+            SettingsSearchHeader(query, { query = it }, "搜索此页设置")
         }
         if (visible.isEmpty()) item("empty") { Text("没有匹配的设置", Modifier.padding(20.dp)) }
         itemsIndexed(visible, key = { _, it -> it.key }) { index, item ->
@@ -276,23 +374,20 @@ private fun SectionPage(
     }
 }
 
+/** 由 LazyColumn 负责吸顶；不透明背景遮住从搜索栏下方滚过的列表内容。 */
+@Composable
+private fun SettingsSearchHeader(query: String, onQueryChange: (String) -> Unit, hint: String) {
+    Surface(color = MaterialTheme.colorScheme.background, modifier = Modifier.testTag("settings_search_header")) {
+        Box(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+            SettingsSearchField(query, onQueryChange, hint)
+        }
+    }
+}
+
 @Composable
 private fun SectionLabel(title: String) {
     Text(
         title, Modifier.padding(start = 12.dp, top = 20.dp, bottom = 8.dp),
         style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary,
     )
-}
-
-private fun sectionPackage(key: String): String = when (key) {
-    "system" -> "android"
-    "systemui" -> "com.android.systemui"
-    "miuihome" -> "com.miui.home"
-    else -> "MyInjector"
-}
-
-private fun sectionIcon(key: String): ImageVector = when (key) {
-    "system" -> MaterialSymbols.RoundedFilled.Tune
-    "systemui" -> MaterialSymbols.RoundedFilled.Notifications
-    else -> MaterialSymbols.RoundedFilled.Home
 }

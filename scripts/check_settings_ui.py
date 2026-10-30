@@ -13,6 +13,10 @@ parser.add_argument('--serial', required=True)
 parser.add_argument('--out', type=Path, default=Path('app/build/reports/ui-smoke'))
 parser.add_argument('--resource-context-package', help='仅加载此已安装包的资源，复现无 Application 的 Context')
 parser.add_argument('--dialogs-only', action='store_true')
+parser.add_argument('--insets-only', action='store_true', help='验证状态栏和键盘开关后的列表边界')
+parser.add_argument('--sticky-search-only', action='store_true', help='验证首页及二级页面搜索栏滚动吸顶')
+parser.add_argument('--launcher-icon-only', action='store_true', help='验证桌面 Activity、可见性开关及框架设置入口')
+parser.add_argument('--scope-only', action='store_true', help='验证作用域开关与独立设置入口')
 parser.add_argument('--service-state-only', action='store_true', help='回归首页缓存入口的异步服务状态更新')
 args = parser.parse_args()
 args.out.mkdir(parents=True, exist_ok=True)
@@ -64,6 +68,213 @@ def start(activity):
     ) else []
     adb('shell', 'am', 'start', '-W', '-n', package + '/' + activity, *extra)
 
+
+if args.launcher_icon_only:
+    entry = package + '/.LauncherActivity'
+    def resolve(category):
+        return adb('shell', 'cmd', 'package', 'query-activities', '--brief', '--user', '0',
+            '-a', 'android.intent.action.MAIN', '-c', category, '-p', package).decode()
+
+    def launcher():
+        return resolve('android.intent.category.LAUNCHER')
+
+    def module_settings():
+        result = resolve('de.robv.android.xposed.category.MODULE_SETTINGS')
+        assert package + '/.SettingsActivity' in result, ('模块设置入口被禁用', result)
+
+    try:
+        adb('shell', 'pm', 'default-state', '--user', '0', entry)
+        start('.LauncherActivity')
+        assert switch('显示桌面图标')['checked'] == 'true'
+        assert launcher().count(entry) == 1, '应只有一个桌面入口且由独立 Activity 提供'
+        pid = adb('shell', 'pidof', package).strip()
+        tap('显示桌面图标')
+        assert switch('显示桌面图标')['checked'] == 'false'
+        assert entry not in launcher(), '关闭后仍有桌面入口'
+        assert adb('shell', 'pidof', package).strip() == pid, '切换图标不应杀死模块进程'
+        module_settings()
+        capture('launcher-icon-hidden')
+        start('.SettingsActivity')
+        assert switch('显示桌面图标')['checked'] == 'false', '重启后应从组件读取隐藏状态'
+        tap('显示桌面图标')
+        assert switch('显示桌面图标')['checked'] == 'true'
+        assert launcher().count(entry) == 1
+        # debug 接收器只修改 PM 状态；实际 PACKAGE_CHANGED 接收器必须在前台实时刷新 UI。
+        def resumed_activity():
+            return next(line.strip() for line in adb('shell', 'dumpsys', 'activity', 'activities').decode().splitlines()
+                if 'topResumedActivity=' in line and package in line)
+        activity_record = resumed_activity()
+        pid = adb('shell', 'pidof', package).strip()
+        for visible in [False, True]:
+            adb('shell', 'am', 'broadcast', '--user', '0', '-n', package + '/.ui.LauncherStateTestReceiver',
+                '--ez', 'visible', str(visible).lower())
+            deadline = time.monotonic() + 30
+            while switch('显示桌面图标')['checked'] != str(visible).lower():
+                assert time.monotonic() < deadline, 'PACKAGE_CHANGED 未刷新图标开关'
+                time.sleep(0.25)
+            assert resumed_activity() == activity_record, '广播更新不应重新打开 Activity'
+            assert adb('shell', 'pidof', package).strip() == pid, '广播更新不应重启进程'
+            assert (entry in launcher()) == visible
+        # 从系统侧修改组件状态，重新打开页面必须反映真实状态，不能使用独立偏好缓存。
+        adb('shell', 'pm', 'disable', '--user', '0', entry)
+        start('.SettingsActivity')
+        assert switch('显示桌面图标')['checked'] == 'false'
+        adb('shell', 'pm', 'enable', '--user', '0', entry)
+        start('.SettingsActivity')
+        assert switch('显示桌面图标')['checked'] == 'true'
+        module_settings()
+        capture('launcher-icon-visible')
+        print('PASS: Activity 唯一桌面入口、显示/隐藏、PACKAGE_CHANGED 前台同步、进程及 Activity 保留、重启及外部组件状态同步、框架入口保留', flush=True)
+    finally:
+        adb('shell', 'pm', 'default-state', '--user', '0', entry)
+    sys.exit(0)
+
+if args.sticky_search_only:
+    def bounds(node):
+        return tuple(map(int, re.findall(r'\d+', node.get('bounds'))))
+
+    def geometry(list_id):
+        root = tree()
+        def tagged(tag):
+            return next(n for n in root.iter('node') if n.get('resource-id') == tag)
+        return bounds(tagged('settings_search_header')), bounds(tagged(list_id)), bounds(tagged('settings_top_bar'))
+
+    def scroll_up(list_id):
+        _, content, _ = geometry(list_id)
+        x = (content[0] + content[2]) // 2
+        height = content[3] - content[1]
+        adb('shell', 'input', 'swipe', str(x), str(content[1] + height * 4 // 5),
+            str(x), str(content[1] + height // 5), '350')
+
+    def check_pinned(list_id, name):
+        header, content, _ = geometry(list_id)
+        assert header[1] > content[1], '搜索栏应从列表原位置开始滚动'
+        for _ in range(3):
+            scroll_up(list_id)
+        header, content, bar = geometry(list_id)
+        assert abs(header[1] - content[1]) <= 1, ('搜索栏没有吸顶', header, content)
+        assert header[1] >= bar[3], ('搜索栏被标题栏遮挡', header, bar)
+        scroll_up(list_id)
+        after, _, _ = geometry(list_id)
+        assert after == header, ('继续滚动后搜索栏位置改变', header, after)
+        capture(name)
+
+    # 固定长列表，避免当前设备安装应用太少、滚动到底仍无法到达吸顶位置。
+    activity = '.ui.SettingsStateTestActivity'
+    adb('shell', 'am', 'force-stop', package)
+    adb('shell', 'am', 'start', '-W', '-n', package + '/' + activity,
+        '--ez', 'connected', 'true', '--ez', 'scope_test', 'true', '--ez', 'scroll_test', 'true')
+    check_pinned('settings_home', 'sticky-search-home')
+    start(activity)
+    tap('系统框架')
+    check_pinned('section_system', 'sticky-search-section')
+    tap('搜索此页设置')
+    adb('shell', 'input', 'text', 'FORCENEWTASKRULES')
+    adb('shell', 'input', 'keyevent', '4')
+    locate('强制 NEW_TASK 规则')
+    tap('清除搜索')
+    locate('搜索此页设置')
+    print('PASS: 首页及二级页搜索栏随列表上移、吸顶后保持位置且可继续搜索', flush=True)
+    sys.exit(0)
+
+if args.insets_only:
+    def bounds(node):
+        return tuple(map(int, re.findall(r'\d+', node.get('bounds'))))
+
+    def frame(kind):
+        output = adb('shell', 'dumpsys', 'window', 'displays').decode()
+        pattern = (r'type=(?:ITYPE_' + kind.upper() + '|' + kind + r')\b[^\n]*?'
+                   r'frame=\[(\d+),\s*(\d+)\]\[(\d+),\s*(\d+)\][^\n]*?visible=true')
+        matches = re.findall(pattern, output)
+        assert matches, '未找到可见 Insets: ' + kind
+        return tuple(map(int, matches[0]))
+
+    def check_layout(list_id, keyboard=False):
+        root = tree()
+        bar = next(n for n in root.iter('node') if n.get('resource-id') == 'settings_top_bar')
+        content = next(n for n in root.iter('node') if n.get('resource-id') == list_id)
+        status_bottom = frame('statusBars')[3] if 'ITYPE_STATUS_BAR' not in adb('shell', 'dumpsys', 'window', 'displays').decode() else frame('status_bar')[3]
+        # 标题栏背景延伸到状态栏，标题文字与返回按钮仍在安全区域内。
+        titles = [n for n in bar.iter('node') if n.get('text') in ('MyInjector', '系统框架')]
+        assert titles, '未找到标题文字'
+        assert all(bounds(n)[1] >= status_bottom for n in titles), ('标题文字进入状态栏', status_bottom)
+        assert bounds(bar)[1] == 0, ('标题栏背景未延伸到状态栏', bounds(bar))
+        if keyboard:
+            keyboard_top = frame('ime')[1]
+            assert bounds(content)[3] <= keyboard_top, ('列表被键盘覆盖', bounds(content), keyboard_top)
+        return bounds(content)
+
+    start('.SettingsActivity')
+    home_before = check_layout('settings_home')
+    tap('搜索应用或系统组件')
+    home_keyboard = check_layout('settings_home', True)
+    assert home_keyboard[3] < home_before[3]
+    capture('insets-home-ime')
+    adb('shell', 'input', 'swipe', '540', '1200', '540', '520', '350')
+    check_layout('settings_home', True)
+    capture('insets-home-collapsed-ime')
+    adb('shell', 'input', 'keyevent', '4')
+    assert check_layout('settings_home')[3] == home_before[3]
+    start('.SettingsActivity')
+    tap('系统框架')
+    section_before = check_layout('section_system')
+    tap('搜索此页设置')
+    section_keyboard = check_layout('section_system', True)
+    assert section_keyboard[3] < section_before[3]
+    adb('shell', 'input', 'swipe', '540', '1200', '540', '520', '350')
+    check_layout('section_system', True)
+    capture('insets-section-ime')
+    adb('shell', 'input', 'keyevent', '4')
+    assert check_layout('section_system')[3] == section_before[3]
+    tap('返回首页')
+    check_layout('settings_home')
+    print('PASS: 首页/二级页键盘避让、收起恢复、折叠标题和返回导航安全边界', flush=True)
+    sys.exit(0)
+
+if args.scope_only:
+    activity = '.ui.SettingsStateTestActivity'
+    adb('shell', 'am', 'force-stop', package)
+    adb('shell', 'am', 'start', '-W', '-n', package + '/' + activity,
+        '--ez', 'scope_test', 'true', '--ez', 'connected', 'true')
+    tap('系统框架')
+    assert switch('启用作用域')['checked'] == 'false'
+    tap('启用作用域')
+    assert switch('启用作用域')['checked'] == 'true'
+    tap('返回首页')
+    # 系统组件按设置能力排序；无模块内设置者与普通应用共用列表开关。
+    tap('搜索应用或系统组件')
+    adb('shell', 'input', 'text', 'SysApp')
+    adb('shell', 'input', 'keyevent', '4')
+    root = tree()
+    texts = [n.get('text') for n in root.iter('node') if n.get('text')]
+    assert texts.index('Z SysApp Telegram') < texts.index('A SysApp Settings'), '有应用内设置者应排在前面'
+    assert '系统组件' in texts and '应用作用域' not in texts, '系统应用应只出现在系统组件组'
+    assert switch('A SysApp Settings作用域')['checked'] == 'false'
+    tap('A SysApp Settings作用域')
+    assert switch('A SysApp Settings作用域')['checked'] == 'true'
+    assert not any(n.get('content-desc') == '返回首页' for n in tree().iter('node')), '普通系统应用不应进入二级页面'
+    tap('应用内设置')
+    assert switch('Z SysApp Telegram作用域')['checked'] == 'false', '系统应用设置入口不能切换作用域'
+    capture('scope-system-apps')
+    tap('清除搜索')
+    tap('搜索应用或系统组件')
+    adb('shell', 'input', 'text', 'Termux')
+    adb('shell', 'input', 'keyevent', '4')
+    assert switch('Termux作用域')['checked'] == 'false'
+    tap('Termux作用域')
+    assert switch('Termux作用域')['checked'] == 'true'
+    assert not any(n.get('text') == '应用内设置' for n in tree().iter('node'))
+    capture('scope-no-settings')
+    tap('清除搜索')
+    tap('搜索应用或系统组件')
+    adb('shell', 'input', 'text', 'Chrome')
+    adb('shell', 'input', 'keyevent', '4')
+    locate('应用内设置')
+    tap('应用内设置')
+    assert switch('Chrome作用域')['checked'] == 'false', '设置入口不能切换作用域'
+    capture('scope-with-settings')
+    print('PASS: 系统模块设置二级开关、系统/普通应用列表开关、设置优先排序与独立设置入口', flush=True)
+    sys.exit(0)
 
 if args.service_state_only:
     activity = '.ui.SettingsStateTestActivity'
@@ -119,7 +330,7 @@ if not args.dialogs_only:
     capture('clipboard')
     tap('取消')
     tap('返回首页')
-    locate('系统界面')
+    locate('系统框架')
     print('PASS: 模块导航、开关持久化、搜索、规则编辑和剪切板选择入口', flush=True)
 
 start('.ui.DialogTestActivity')
