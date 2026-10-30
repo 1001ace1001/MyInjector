@@ -252,10 +252,14 @@ jobs:
         if: ${{ success() && steps.merge.outputs.changed != '' && github.event.inputs.dry_run != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          # 必须锁定本仓库：工作区里同时存在 origin 和 upstream 两个远端，
+          # gh 可能解析到 upstream（5ec1cff/MyInjector），dispatch 会 403。
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           # build.yaml 只监听 master 的 push 和 v* tag；用 PAT 推送时 master 会自动触发编译，
           # 其他分支以及 GITHUB_TOKEN 推送的情况都不会触发，必须显式 dispatch。
+          repo="${GITHUB_REPOSITORY}"
           pat_used=0
           if [ -n "${{ secrets.SYNC_TOKEN }}" ]; then pat_used=1; fi
           IFS=' ' read -ra branches <<< '${{ steps.merge.outputs.changed }}'
@@ -264,6 +268,9 @@ jobs:
               echo "$b 由 push 事件自动触发编译，跳过 dispatch"
               continue
             fi
-            echo "dispatch build.yaml on $b"
-            gh workflow run build.yaml --ref "$b"
+            echo "dispatch build.yaml on $repo@$b"
+            gh workflow run build.yaml --repo "$repo" --ref "$b"
+            sleep 3
+            gh run list --repo "$repo" --workflow build.yaml --branch "$b" --limit 1 \
+              --json databaseId,status,url --jq '.[] | "已触发：\(.url) (\(.status))"'
           done
