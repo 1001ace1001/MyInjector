@@ -75,6 +75,13 @@ jobs:
           raw='${{ github.event.inputs.branches }}'
           if [ -z "${raw// /}" ]; then raw='${{ vars.SYNC_BRANCHES }}'; fi
           if [ -z "${raw// /}" ]; then raw='master'; fi
+          # 常见误填：把上游仓库地址贴进了“要同步的分支”。这里直接给出提示。
+          case "$raw" in
+            *://*|*.git*)
+              echo "::error::“要同步的分支”应填本仓库的分支名（如 master），不是仓库地址；上游地址固定为 ${UPSTREAM_REPO}"
+              exit 1
+              ;;
+          esac
           list=$(printf '%s' "$raw" | tr -d ' ' | tr ',' '\n' | sed '/^$/d' | sort -u | paste -sd, -)
           echo "branches=$list" >> "$GITHUB_OUTPUT"
           echo "本次同步分支：$list"
