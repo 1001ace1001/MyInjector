@@ -152,6 +152,12 @@ object HookConfigs {
             .build()
     }
 
+    fun market(prefs: ConfigValues) = MarketConfig(
+        removeSplashAd = prefs.getBoolean("marketRemoveSplashAd", true),
+        superMinimalMode = prefs.getBoolean("marketSuperMinimalMode", true),
+        simplifyUpdates = prefs.getBoolean("marketSimplifyUpdates", true),
+    )
+
     fun miuiHome(prefs: ConfigValues): MiuiHomeConfig {
         return MiuiHomeConfig.newBuilder()
             .setOpenAospSettings(prefs.getBoolean("miuiHomeOpenAospSettings", false))

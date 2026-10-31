@@ -76,6 +76,7 @@ class Entry : XposedModule() {
                 "com.miui.gallery" -> MiuiGalleryHandler
                 "app.lawnchair", "app.lawnchair.nightly", "app.lawnchair.debug" -> LawnchairHandler
                 "tv.danmaku.bili" -> BiliHandler()
+                "com.xiaomi.market" -> XiaomiMarketHandler()
                 else -> return
             }
         }

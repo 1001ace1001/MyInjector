@@ -29,6 +29,11 @@ object SettingsSchema {
             "loopNotificationControlCenter" to false,
             "topPullSwitchNotificationControlCenter" to false
         ),
+        "market" to linkedMapOf<String, Any>(
+            "marketRemoveSplashAd" to true,
+            "marketSuperMinimalMode" to true,
+            "marketSimplifyUpdates" to true
+        ),
         "miuihome" to linkedMapOf<String, Any>(
             "miuiHomeOpenAospSettings" to false,
             "miuiHomeDragKill" to false,
