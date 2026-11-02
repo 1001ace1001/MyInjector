@@ -56,17 +56,6 @@ class DisableProfileAvatarBlur : MyDynHook("disableProfileAvatarBlur") {
         }
     }
 
-    private fun setActionsColor(actionsView: Any, color: Int, hasColorById: Boolean) {
-        if ("actionsSetActionsColor" in memberMethods) {
-            invoke("actionsSetActionsColor", actionsView, color, hasColorById)
-        } else {
-            // setActionsColor can be inlined into TopView.onDraw; checkPaints is empty.
-            memberFields.getValue("actionsColor").setInt(actionsView, color)
-            memberFields.getValue("actionsHasColorById").setBoolean(actionsView, hasColorById)
-            invoke("actionsCreateColorShader", actionsView)
-        }
-    }
-
     /**
      * =========================
      * Exteragram 方案二相关状态
@@ -168,17 +157,9 @@ class DisableProfileAvatarBlur : MyDynHook("disableProfileAvatarBlur") {
         }
 
         if (originalStyle != null) {
-            val originalColor = originalStyle.actionsColor
-            if (originalColor != null) {
-                runCatching {
-                    changingActionsColor = true
-                    setActionsColor(actionsViewObj, originalColor, false)
-                }.also {
-                    changingActionsColor = false
-                }
-            }
-
-            // 同理放在 setActionsColor 之后，避免 createColorShader 覆盖缓存的原始画笔。
+            // 与旧版修复保持一致：只恢复画笔。旧版在 exteraGram 上调用的两参数
+            // setActionsColor 并不存在，实际生效的只有画笔与渐变；若改写 color /
+            // hasColorById，会在下一次 updateBackgroundPaint 前闪一下系统底色。
             runCatching {
                 val paint = readAs<Paint>(actionsViewObj, "actionsPaint")
                 paint.color = originalStyle.paintColor
@@ -207,16 +188,8 @@ class DisableProfileAvatarBlur : MyDynHook("disableProfileAvatarBlur") {
             memberFields.getValue("actionsRadialGradient").set(actionsViewObj, null)
         }
 
-        runCatching {
-            changingActionsColor = true
-            setActionsColor(actionsViewObj, Color.WHITE, false)
-        }.also {
-            changingActionsColor = false
-        }
-
-        // 必须在 setActionsColor 之后设置：exteraGram 的 setActionsColor 为 (int, int, boolean)，
-        // 走字段 + createColorShader 回退路径，hasColorById=false 时 createColorShader 会
-        // paint.setColor(color) 把半透明黑底覆盖成纯白，导致下拉头像后按钮变白块。
+        // 与旧版修复保持一致：只把画笔设为半透明黑并清掉渐变，不改 color / hasColorById。
+        // 旧版的两参数 setActionsColor 在 exteraGram 上调用失败，从未真正生效。
         runCatching {
             val paint = readAs<Paint>(actionsViewObj, "actionsPaint")
             paint.color = Color.BLACK
@@ -347,6 +320,19 @@ class DisableProfileAvatarBlur : MyDynHook("disableProfileAvatarBlur") {
 
                 (param.thisObject as View).setPadding(0, 0, 0, 0)
             }
+        // 新版 ProfileGalleryBlurView.setSize 会把 actions 高度重新设为画廊底部 padding，
+        // 模糊被禁用后这段区域只剩 TopView 黑底，需要再次清零。
+        memberMethods["blurSetSize"]?.hookAfter(cond = ::isEnabled) { param ->
+            if (!extendAvatar) {
+                return@hookAfter
+            }
+
+            val gallery = memberFields["blurGalleryView"]?.get(param.thisObject) as? View
+                ?: return@hookAfter
+            if (gallery.paddingBottom != 0) {
+                gallery.setPadding(0, 0, 0, 0)
+            }
+        }
 
         /*
          * set proper shadow

@@ -158,6 +158,20 @@ private fun findProfileAvatarBlur(bridge: DexKitBridge, baseFragment: String): M
     save("actionsView", actions)
     val actionsClass = actions.type
     save("blurActionsView", blur.fields.single { it.typeName == actions.typeName })
+    // 新版 ProfileGalleryBlurView.setSize(int) 会把 actions 高度重新写成画廊底部 padding，
+    // 模糊被禁用后这块区域只剩 TopView 黑底，需要再清零一次。
+    save("blurSetSize", blur.findMethod {
+        matcher {
+            paramTypes("int")
+            returnType("void")
+            addInvoke {
+                declaredClass("android.view.View")
+                name("setPadding")
+                paramTypes("int", "int", "int", "int")
+            }
+        }
+    }.singleOrNull())
+    save("blurGalleryView", blur.fields.singleOrNull { it.typeName == gallery.name })
     val shader = actionsClass.findMethod {
         matcher {
             paramTypes()
@@ -335,6 +349,8 @@ internal fun profileAvatarBlurMembers(creator: ObfsTableCreator): Map<String, Ob
         "topUpdateBackgroundPaint",
         "actionsView",
         "blurActionsView",
+        "blurSetSize",
+        "blurGalleryView",
         "actionsCreateColorShader",
         "actionsPaint",
         "actionsColor",
