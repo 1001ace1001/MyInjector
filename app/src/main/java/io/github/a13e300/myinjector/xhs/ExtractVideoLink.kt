@@ -6,11 +6,13 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.ApplicationInfo
+import android.content.res.Configuration
 import android.graphics.PixelFormat
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -36,6 +38,8 @@ import io.github.a13e300.myinjector.ui.modernInjectedButton
 import io.github.a13e300.myinjector.ui.modernInjectedScrollContent
 import io.github.a13e300.myinjector.ui.showModernInjectedDialog
 import io.github.a13e300.myinjector.ui.InjectedDialogContext
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 class ExtractVideoLink : MyDynHook("extractVideoLink") {
     override fun isFeatureEnabled(): Boolean = XhsHandler.settings.extractVideoLink
@@ -73,12 +77,13 @@ class ExtractVideoLink : MyDynHook("extractVideoLink") {
             val winWidth: Int = 40.dp2px(activity.resources).toInt()
             val winHeight: Int = winWidth
             val wm = activity.windowManager
+            private val positionPrefs = activity.getSharedPreferences(
+                "myinjector_video_link_window", Context.MODE_PRIVATE
+            )
             val lp = WindowManager.LayoutParams().apply {
                 gravity = Gravity.LEFT or Gravity.TOP
                 format = PixelFormat.RGBA_8888
                 type = WindowManager.LayoutParams.TYPE_APPLICATION_PANEL
-                x = context.resources.displayMetrics.widthPixels - winWidth
-                y = context.resources.displayMetrics.heightPixels.times(0.9).toInt()
                 alpha = 0.7f
                 width = winWidth
                 height = winHeight
@@ -87,6 +92,7 @@ class ExtractVideoLink : MyDynHook("extractVideoLink") {
             }
 
             init {
+                restorePosition()
                 val v = LayoutInflater.from(context).inflate(R.layout.floating_window, null, false)
                 v.setOnClickListener {
                     runCatching {
@@ -139,28 +145,73 @@ class ExtractVideoLink : MyDynHook("extractVideoLink") {
 
             private var lastX: Int = 0
             private var lastY: Int = 0
+            private var downX: Int = 0
+            private var downY: Int = 0
+            private val touchSlop = ViewConfiguration.get(activity).scaledTouchSlop
+            private var dragging = false
+
+            private fun restorePosition() {
+                val metrics = activity.resources.displayMetrics
+                lp.x = (metrics.widthPixels * positionPrefs.getFloat("xRatio", 1f)).roundToInt()
+                    .coerceIn(0, (metrics.widthPixels - winWidth).coerceAtLeast(0))
+                lp.y = (metrics.heightPixels * positionPrefs.getFloat("yRatio", 0.6f)).roundToInt()
+                    .coerceIn(0, (metrics.heightPixels - winHeight).coerceAtLeast(0))
+            }
+
+            private fun savePosition() {
+                val metrics = activity.resources.displayMetrics
+                positionPrefs.edit()
+                    .putFloat("xRatio", lp.x.toFloat() / metrics.widthPixels)
+                    .putFloat("yRatio", lp.y.toFloat() / metrics.heightPixels)
+                    .apply()
+            }
+
+            override fun onConfigurationChanged(newConfig: Configuration) {
+                super.onConfigurationChanged(newConfig)
+                restorePosition()
+                if (isAttachedToWindow) wm.updateViewLayout(this, lp)
+            }
+
+            // 开始拖动后由 ViewGroup 取消子按钮的触摸，避免抬手时触发点击。
+            override fun onInterceptTouchEvent(ev: MotionEvent): Boolean =
+                dragging || super.onInterceptTouchEvent(ev)
+
+            override fun onTouchEvent(event: MotionEvent): Boolean =
+                dragging || super.onTouchEvent(event)
 
             override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-                when (ev.action) {
+                when (ev.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
                         lastX = ev.rawX.toInt()
                         lastY = ev.rawY.toInt()
+                        downX = lastX
+                        downY = lastY
+                        dragging = false
                     }
 
-                    MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP -> {
                         val curX = ev.rawX.toInt()
                         val curY = ev.rawY.toInt()
+                        if (!dragging) {
+                            dragging = abs(curX - downX) > touchSlop || abs(curY - downY) > touchSlop
+                        }
+                        if (!dragging) return super.dispatchTouchEvent(ev)
                         val dx = curX - lastX
                         val dy = curY - lastY
                         lastX = curX
                         lastY = curY
-                        val coords = IntArray(2)
-                        getLocationOnScreen(coords)
-                        lp.x = coords[0] + dx
-                        lp.y = coords[1] + dy
+                        val metrics = activity.resources.displayMetrics
+                        // x/y 是窗口偏移，不能累加 getLocationOnScreen 中的系统栏偏移。
+                        lp.x = (lp.x + dx).coerceIn(0, (metrics.widthPixels - winWidth).coerceAtLeast(0))
+                        lp.y = (lp.y + dy).coerceIn(0, (metrics.heightPixels - winHeight).coerceAtLeast(0))
 
                         wm.updateViewLayout(this, lp)
                     }
+                }
+                if (dragging &&
+                    (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL)
+                ) {
+                    savePosition()
                 }
                 return super.dispatchTouchEvent(ev)
             }
