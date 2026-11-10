@@ -1,0 +1,2 @@
+# 作用域清单是纯追加列表，同步上游时按并集合并，避免 -X ours 丢掉上游新增的包名。
+app/src/main/resources/META-INF/xposed/scope.list merge=union
